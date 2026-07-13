@@ -1,0 +1,14 @@
+node_modules
+dist
+dev-dist
+.vercel
+.DS_Store
+*.local
+
+# secrets & env
+.env
+.env.*
+# stray test/output dumps
+wk_*.json
+weekly*.json
+*.output
