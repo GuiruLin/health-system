@@ -32,7 +32,16 @@ export default async function handler(req, res) {
       if (!raw) return res.status(200).json({ data: null, ts: 0 });
       try {
         const obj = JSON.parse(raw);
-        return res.status(200).json({ data: obj.data || null, ts: obj.ts || 0 });
+        let data = obj.data || null;
+        // Never expose the Strava refresh token over the public read — strip it
+        // so a shared URL can't hand anyone a key into her Strava account.
+        // (The server-side weekly job reads the raw Redis blob directly, so it
+        //  still has the token; only a fresh reinstall would need to reconnect Strava.)
+        if (data && ("hs:strava:refresh" in data)) {
+          const { ["hs:strava:refresh"]: _omit, ...safe } = data;
+          data = safe;
+        }
+        return res.status(200).json({ data, ts: obj.ts || 0 });
       } catch {
         return res.status(200).json({ data: null, ts: 0 });
       }

@@ -125,6 +125,27 @@ async function callClaude(messages, system, maxTokens = 1000) {
   const data = await res.json();
   return (data.content || []).filter(c => c.type === "text").map(c => c.text).join("\n");
 }
+// Normalise any picked image (incl. iPhone HEIC/HEIF) to a JPEG data URL, and
+// downscale it. Anthropic vision only accepts jpeg/png/gif/webp, so sending a
+// raw HEIC file (the iOS camera default) fails with "Could not process image".
+function fileToJpegDataUrl(file, maxDim = 1200, quality = 0.85) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+      const scale = Math.min(1, maxDim / Math.max(w, h));
+      w = Math.max(1, Math.round(w * scale)); h = Math.max(1, Math.round(h * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      try { resolve(canvas.toDataURL("image/jpeg", quality)); } catch (err) { reject(err); }
+    };
+    img.onerror = err => { URL.revokeObjectURL(url); reject(err); };
+    img.src = url;
+  });
+}
 function parseJSON(text) {
   const clean = (text || "").replace(/```json|```/g, "").trim();
   try { return JSON.parse(clean); } catch { return null; }
@@ -247,9 +268,7 @@ const METRIC_TYPES = [
   { key: "肌肉量 (kg)", zh: "肌肉量 (kg)", en: "Muscle mass (kg)" },
   { key: "相位角 (°)", zh: "相位角 (°)", en: "Phase angle (°)" },
   { key: "内脏脂肪 (cm²)", zh: "内脏脂肪 (cm²)", en: "Visceral fat (cm²)" },
-  { key: "深蹲 1RM", zh: "深蹲 1RM", en: "Squat 1RM" },
-  { key: "硬拉 1RM", zh: "硬拉 1RM", en: "Deadlift 1RM" },
-  { key: "卧推 1RM", zh: "卧推 1RM", en: "Bench 1RM" },
+  { key: "BMR (kcal)", zh: "BMR (kcal)", en: "BMR (kcal)" },
   { key: "ApoB", zh: "ApoB", en: "ApoB" },
   { key: "空腹血糖 (mmol/L)", zh: "空腹血糖 (mmol/L)", en: "Fasting glucose (mmol/L)" },
   { key: "HbA1c (%)", zh: "HbA1c (%)", en: "HbA1c (%)" },
@@ -257,10 +276,10 @@ const METRIC_TYPES = [
   { key: "其他", zh: "其他", en: "Other" },
 ];
 const SUPP_PRESETS = [
-  { key: "蛋白粉", zh: "蛋白粉", en: "Protein powder" },
-  { key: "肌酸", zh: "肌酸", en: "Creatine" },
-  { key: "鱼油+维D", zh: "鱼油 + 维D", en: "Fish oil + Vit D" },
-  { key: "镁", zh: "镁", en: "Magnesium" },
+  { key: "蛋白粉", zh: "蛋白粉 · 早上", en: "Protein · AM" },
+  { key: "肌酸", zh: "肌酸 · 早上", en: "Creatine · AM" },
+  { key: "鱼油+维D", zh: "鱼油 · 午餐", en: "Fish oil · lunch" },
+  { key: "镁", zh: "镁 · 睡前", en: "Magnesium · night" },
   { key: "铁", zh: "铁", en: "Iron" },
   { key: "钙", zh: "钙", en: "Calcium" },
   { key: "维生素B12", zh: "维生素 B12", en: "Vitamin B12" },
@@ -269,9 +288,11 @@ const SUPP_PRESETS = [
   { key: "益生菌", zh: "益生菌", en: "Probiotics" },
   { key: "维生素C", zh: "维生素 C", en: "Vitamin C" },
   { key: "锌", zh: "锌", en: "Zinc" },
+  { key: "维D3+K2", zh: "维 D3+K2 · 午餐", en: "Vit D3+K2 · lunch" },
+  { key: "南非醉茄", zh: "南非醉茄 · 睡前", en: "Ashwagandha · night" },
 ];
 const DEFAULT_SUPP_KEYS = ["蛋白粉", "肌酸", "鱼油+维D", "镁"];
-const SUGGESTED_SUPP_KEYS = ["铁", "钙", "维生素B12", "电解质", "胶原蛋白", "益生菌", "维生素C", "锌"];
+const SUGGESTED_SUPP_KEYS = ["维D3+K2", "南非醉茄", "铁", "钙", "维生素B12", "电解质", "胶原蛋白", "益生菌", "维生素C", "锌"];
 // localize an enum key for display; falls back to the raw key (user-typed values)
 function enumLabel(list, key, lang) {
   const hit = list.find(o => o.key === key);
@@ -377,14 +398,15 @@ const STR = {
     duration: "时长 (min)", addTraining: "添加训练", noTrain7: "今天 / 昨天没有训练记录",
     // log / food
     food: "饮食", snap: "拍一餐", photo: "拍照 / 选图", manualAdd: "手动添加",
-    proteinG: "蛋白质 (g)", fibreG: "纤维 (g)", note: "备注", noteOpt: "备注(可选)",
+    proteinG: "蛋白质 (g)", fibreG: "纤维 (g)", kcalG: "热量 (kcal)", kcal: "热量", note: "备注", noteOpt: "备注(可选)",
     egMeal: "例：鸡胸 + 米饭", fuelled: "训练前后补给", saveMeal: "记录这一餐",
-    analyzing: "AI 估算中…", kcalNote: "", todayProtein: "今日蛋白", todayFibre: "今日纤维",
+    analyzing: "AI 估算中…", kcalNote: "", todayProtein: "今日蛋白", todayFibre: "今日纤维", todayCal: "今日热量", calRef: "参考:休息~2100 · 训练~2500 · 长跑~3100",
     cancel: "取消",
     // supplements
     supps: "补剂", editList: "编辑清单", done: "完成", otherFill: "其他·自己填", add: "添加",
     // goals
     goals: "目标", weight: "体重 (kg)", proteinPerKg: "蛋白 g/kg", fibreTarget: "纤维目标 (g/天)",
+    hrvBaseL: "HRV 基线", rhrBaseL: "RHR 基线", baselineNote: "默认基线 HRV 40 / RHR 54,教练拿它对比。想改随时在这里填,填了以你的为准。",
     proteinTargetTxt: "→ 蛋白质目标", perDay: "g/天", saveGoals: "保存目标",
     // race
     raceTitle: "备赛", raceName: "赛事名称", raceNamePh: "例：半马 / 比赛名", raceDate: "赛事日期",
@@ -424,10 +446,13 @@ const STR = {
     pRestNote: "休息 / 放松", pStrengthNote: "大重量", pQualityGen: "间歇训练",
     pThr: "阈值 (Z4)", pVo2: "最大摄氧 (Z5)", pSharp: "赛前短刺激",
     planPeak: "长距离峰值 (km)", planNeedDate: "在下方「备赛」设置比赛日期,自动生成马拉松进阶计划。",
+    planExpand: "展开本周计划", planCollapse: "收起", planAskPh: "问教练这份计划…",
+    briefShow: "展开本周周报", briefHide: "收起周报", planUpdated: "（计划表已更新）", clearChat: "清空对话",
     planAutoNote: "长距离随赛期自动进阶、赛前自动减量。计划是参考:HRV 低或经期就把间歇/Tempo 换成 Z2。",
     todayPlan: "今日计划", dow: ["周一", "周二", "周三", "周四", "周五", "周六", "周日"],
     pPilates: "普拉提", pPilatesNote: "放松 / 恢复", planNotePh: "备注(如 下肢 / 30–45min)",
     editPlan: "编辑计划", planDone: "完成", loadCoach: "载入教练计划",
+    refreshAnalysis: "更新本周分析", refreshingWk: "分析中…约30秒", refreshDone: "已更新。往上看新的本周分析,再点「载入教练计划」应用新计划。", refreshFail: "更新失败,请稍后再试。", refreshCooled: n => `刚更新过,${n} 分钟后可再更新(上方已是最新)。`,
     askYou: "你:", askCoachLbl: "教练:", askPh: "就这些建议追问…", askSend: "问",
     runView: "跑步", paceTitle: "配速 (分钟/公里)", paceNote: "越低=越快", runHrTitle: "跑步心率 (平均)",
     distTitle: "跑步距离 (公里)", noRuns: "这个范围内没有跑步记录",
@@ -451,12 +476,13 @@ const STR = {
     training: "Training", type: "Type", otherName: "Name (pilates / climbing / hike…)",
     duration: "Duration (min)", addTraining: "Add training", noTrain7: "No training today or yesterday",
     food: "Food", snap: "Snap a meal", photo: "Photo / pick", manualAdd: "Add manually",
-    proteinG: "Protein (g)", fibreG: "Fibre (g)", note: "Note", noteOpt: "Note (optional)",
+    proteinG: "Protein (g)", fibreG: "Fibre (g)", kcalG: "Calories (kcal)", kcal: "Calories", note: "Note", noteOpt: "Note (optional)",
     egMeal: "e.g. chicken breast + rice", fuelled: "Pre/post-workout fuel", saveMeal: "Save meal",
-    analyzing: "AI estimating…", kcalNote: "", todayProtein: "Protein today", todayFibre: "Fibre today",
+    analyzing: "AI estimating…", kcalNote: "", todayProtein: "Protein today", todayFibre: "Fibre today", todayCal: "Calories today", calRef: "ref: rest ~2100 · training ~2500 · long run ~3100",
     cancel: "Cancel",
     supps: "Supplements", editList: "Edit list", done: "Done", otherFill: "Other (type your own)", add: "Add",
     goals: "Goals", weight: "Weight (kg)", proteinPerKg: "Protein g/kg", fibreTarget: "Fibre target (g/day)",
+    hrvBaseL: "HRV baseline", rhrBaseL: "RHR baseline", baselineNote: "Defaults to HRV 40 / RHR 54, which the coach compares against. Type your own here any time and yours wins.",
     proteinTargetTxt: "→ Protein target", perDay: "g/day", saveGoals: "Save goals",
     raceTitle: "Race", raceName: "Race name", raceNamePh: "e.g. half marathon", raceDate: "Race date",
     raceUntil1: "", raceUntil2: " — ", raceUntil3: " days to go", racePast: "passed",
@@ -491,10 +517,13 @@ const STR = {
     pRestNote: "Rest / mobility", pStrengthNote: "Heavy", pQualityGen: "Interval work",
     pThr: "Threshold (Z4)", pVo2: "VO2max (Z5)", pSharp: "Pre-race strides",
     planPeak: "Long-run peak (km)", planNeedDate: "Set a race date under Race below to auto-build a marathon plan.",
+    planExpand: "Show full week", planCollapse: "Collapse", planAskPh: "Ask the coach about this plan…",
+    briefShow: "Show weekly report", briefHide: "Hide report", planUpdated: "(plan table updated)", clearChat: "Clear chat",
     planAutoNote: "Long run auto-progresses and tapers before race day. It's a guide: swap quality for Z2 when HRV is low or during your period.",
     todayPlan: "Today's plan", dow: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
     pPilates: "Pilates", pPilatesNote: "Recovery", planNotePh: "Note (e.g. lower / 30–45min)",
     editPlan: "Edit plan", planDone: "Done", loadCoach: "Load coach plan",
+    refreshAnalysis: "Refresh weekly analysis", refreshingWk: "Analyzing… ~30s", refreshDone: "Updated. See the new analysis above, then tap Load coach plan to apply.", refreshFail: "Update failed, try again later.", refreshCooled: n => `Just updated — try again in ${n} min (latest shown above).`,
     askYou: "You: ", askCoachLbl: "Coach: ", askPh: "Ask about this advice…", askSend: "Ask",
     runView: "Running", paceTitle: "Pace (min/km)", paceNote: "Lower = faster", runHrTitle: "Running HR (avg)",
     distTitle: "Distance (km)", noRuns: "No runs in this range",
@@ -708,6 +737,7 @@ export default function App() {
   const todayMeals = meals.filter(m => m.date === tk);
   const todayProtein = todayMeals.reduce((s, m) => s + (Number(m.protein) || 0), 0);
   const todayFibre = todayMeals.reduce((s, m) => s + (Number(m.fibre) || 0), 0);
+  const todayCal = todayMeals.reduce((s, m) => s + (Number(m.cal) || 0), 0);
   const ydate = keyOf(new Date(Date.now() - 86400000));
   const ydayMeals = meals.filter(m => m.date === ydate);
   const proteinYday = ydayMeals.reduce((s, m) => s + (Number(m.protein) || 0), 0);
@@ -728,8 +758,10 @@ export default function App() {
   // baselines from history (last 14 entries with values)
   const recent = history.slice(-14);
   const avg = (arr, f) => { const v = arr.map(f).filter(x => x != null && !isNaN(x)); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
-  const hrvBase = avg(recent, d => Number(d.hrv));
-  const rhrBase = avg(recent, d => Number(d.rhr));
+  // Baseline: what she types in the Goals card wins; otherwise her stated
+  // baseline (HRV 40 / RHR 54), which is steadier than a bouncing 14-day average.
+  const hrvBase = Number(profile?.hrvBase) || 40;
+  const rhrBase = Number(profile?.rhrBase) || 54;
 
   // simple readiness score
   function readiness() {
@@ -751,7 +783,7 @@ export default function App() {
     baselines: { hrv: hrvBase ? Math.round(hrvBase) : null, rhr: rhrBase ? Math.round(rhrBase) : null, sleep_target: SLEEP_TARGET },
     cycle: phase ? { day: phase.day, phase: phase.phase } : null,
     last7_training: trainings.filter(t => daysBetween(t.date, tk) < 7).map(t => ({ type: t.type, min: t.duration, rpe: t.rpe || null, km: t.km || null, hr: t.hr || null, effort: t.effort ?? null })),
-    protein_today_g: todayProtein, protein_target_g: proteinTarget,
+    calories_today: todayCal || null, protein_today_g: todayProtein, protein_target_g: proteinTarget,
     fibre_today_g: todayFibre, fibre_target_g: fibreTarget,
     protein_yesterday_g: proteinYday, fibre_yesterday_g: fibreYday,
     recent_sleep: recent.slice(-7).map(d => ({ date: d.date, hrs: d.sleepTotal, deep: d.deep })),
@@ -1002,8 +1034,12 @@ function SleepPage({ daily, saveDaily, hrvBase, rhrBase, history }) {
   const RANGES = [[`14${L.days}`, 14], [`30${L.days}`, 30], [`90${L.days}`, 90], [L.all, 99999]];
   const [range, setRange] = useState(14);
   const last = range >= 99999 ? history : history.slice(-range);
-  const sleepData = last.map(h => ({ x: fmtShort(h.date), total: Number(h.sleepTotal) || 0, deep: Number(h.deep) || 0 }));
-  const hrData = last.filter(h => h.hrv || h.rhr).map(h => ({ x: fmtShort(h.date), hrv: Number(h.hrv) || null, rhr: Number(h.rhr) || null }));
+  // Guard against corrupt data points (e.g. a bad Apple Health sync writing a raw
+  // sensor value): keep only physiologically plausible numbers so one garbage
+  // reading can't blow up the whole trend's axis.
+  const inRange = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : null; };
+  const sleepData = last.map(h => ({ x: fmtShort(h.date), total: inRange(h.sleepTotal, 0, 20) || 0, deep: inRange(h.deep, 0, 20) || 0 }));
+  const hrData = last.filter(h => h.hrv || h.rhr).map(h => ({ x: fmtShort(h.date), hrv: inRange(h.hrv, 5, 300), rhr: inRange(h.rhr, 25, 150) }));
 
   return (
     <div className="hs-grid">
@@ -1026,9 +1062,12 @@ function SleepPage({ daily, saveDaily, hrvBase, rhrBase, history }) {
       {/* 心率 */}
       <Card>
         <SectionTitle>{L.hrCard} <span className="hs-opt">{L.optional}</span></SectionTitle>
+        {(hrvBase || rhrBase) && (
+          <p className="hs-muted-sm">{L.baseline} · HRV {Math.round(hrvBase)} · RHR {Math.round(rhrBase)}</p>
+        )}
         <div className="hs-row2">
-          <Num label={`HRV (ms)${hrvBase ? " · " + L.baseline + " " + Math.round(hrvBase) : ""}`} v={d.hrv} onChange={v => set("hrv", v)} />
-          <Num label={`RHR (bpm)${rhrBase ? " · " + L.baseline + " " + Math.round(rhrBase) : ""}`} v={d.rhr} onChange={v => set("rhr", v)} />
+          <Num label="HRV (ms)" v={d.hrv} onChange={v => set("hrv", v)} />
+          <Num label="RHR (bpm)" v={d.rhr} onChange={v => set("rhr", v)} />
         </div>
         <button className="hs-btn" onClick={commit}><Check size={15} />{L.save}</button>
       </Card>
@@ -1048,7 +1087,7 @@ function SleepPage({ daily, saveDaily, hrvBase, rhrBase, history }) {
         <ChartWrap>
           <BarChart data={sleepData}>
             <CartesianGrid stroke={C.line} vertical={false} />
-            <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis tick={{ fontSize: 10, fill: C.ink }} />
+            <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis tick={{ fontSize: 11, fill: C.ink }} />
             <Tooltip /><ReferenceLine y={SLEEP_TARGET} stroke={C.clay} strokeDasharray="4 4" />
             <Bar dataKey="total" fill={C.pine} radius={[3, 3, 0, 0]} />
             <Bar dataKey="deep" fill={C.amber} radius={[3, 3, 0, 0]} />
@@ -1062,7 +1101,7 @@ function SleepPage({ daily, saveDaily, hrvBase, rhrBase, history }) {
         <ChartWrap>
           <LineChart data={hrData}>
             <CartesianGrid stroke={C.line} vertical={false} />
-            <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis tick={{ fontSize: 10, fill: C.ink }} />
+            <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis tick={{ fontSize: 11, fill: C.ink }} />
             <Tooltip />
             <Line dataKey="hrv" stroke={C.pine} strokeWidth={2} dot={false} connectNulls />
             <Line dataKey="rhr" stroke={C.clay} strokeWidth={2} dot={false} connectNulls />
@@ -1086,48 +1125,54 @@ function DietPage({ tk, meals, history, reload, proteinTarget, fibreTarget, prof
   const [est, setEst] = useState(null);
   const [fuelled, setFuelled] = useState(false);
   const [manual, setManual] = useState(false);
-  const [mForm, setMForm] = useState({ protein: "", fibre: "", note: "", fuelled: false });
+  const [mForm, setMForm] = useState({ protein: "", fibre: "", cal: "", note: "", fuelled: false });
   const [editMeal, setEditMeal] = useState(null);
   const delEntry = async (prefix, id) => { await store.del(`${prefix}:${id}`); reload(); };
 
   const onPhoto = async e => {
     const file = e.target.files?.[0]; if (!file) return;
-    const b64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(",")[1]); r.onerror = rej; r.readAsDataURL(file); });
-    setThumb(`data:${file.type};base64,${b64}`);
     setAnalyzing(true); setEst(null);
     try {
+      // Convert to JPEG in-browser first (handles iPhone HEIC + shrinks payload).
+      let dataUrl;
+      try { dataUrl = await fileToJpegDataUrl(file); }
+      catch { const r = new FileReader(); dataUrl = await new Promise((res, rej) => { r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); }); }
+      setThumb(dataUrl);
+      const b64 = dataUrl.split(",")[1];
+      const media_type = (dataUrl.match(/^data:([^;]+);/) || [])[1] || "image/jpeg";
       const text = await callClaude(
         [{ role: "user", content: [
-          { type: "image", source: { type: "base64", media_type: file.type || "image/jpeg", data: b64 } },
+          { type: "image", source: { type: "base64", media_type, data: b64 } },
           { type: "text", text: lang === "en"
-            ? "Estimate this meal's protein (g) and fibre (g), plus a short nutrition note (English). Return JSON ONLY, no other text: {\"protein\":number,\"fibre\":number,\"note\":\"...\"}. Note: estimates are directional."
-            : "估算这餐的蛋白质(g)和纤维(g),给一句简短的营养备注(中文)。仅返回 JSON,无其他文字:{\"protein\":数字,\"fibre\":数字,\"note\":\"...\"}。提醒:估算是方向性的。" },
+            ? "Estimate this meal's calories (kcal), protein (g) and fibre (g), plus a short nutrition note (English). Return JSON ONLY, no other text: {\"cal\":number,\"protein\":number,\"fibre\":number,\"note\":\"...\"}. Note: estimates are directional."
+            : "估算这餐的热量(kcal)、蛋白质(g)和纤维(g),给一句简短的营养备注(中文)。仅返回 JSON,无其他文字:{\"cal\":数字,\"protein\":数字,\"fibre\":数字,\"note\":\"...\"}。提醒:估算是方向性的。" },
         ] }], lang === "en" ? "You are a nutrition estimator, return JSON only." : "你是营养估算助手,只返回 JSON。", 400);
       const j = parseJSON(text);
-      setEst(j || { protein: 0, fibre: 0, note: lang === "en" ? "Couldn't parse (check /api/claude & API key)" : "无法解析(检查 /api/claude 与 API key)" });
-    } catch { setEst({ protein: 0, fibre: 0, note: lang === "en" ? "Couldn't reach AI (check network / deploy / API key)" : "无法连接 AI(检查网络/部署/API key)" }); }
+      setEst(j || { cal: 0, protein: 0, fibre: 0, note: lang === "en" ? "Couldn't parse (check /api/claude & API key)" : "无法解析(检查 /api/claude 与 API key)" });
+    } catch { setEst({ cal: 0, protein: 0, fibre: 0, note: lang === "en" ? "Couldn't reach AI (check network / deploy / API key)" : "无法连接 AI(检查网络/部署/API key)" }); }
     setAnalyzing(false);
   };
   const saveMeal = async () => {
     if (!est) return;
     const id = Date.now();
-    await store.set(`meal:${id}`, { id, date: tk, protein: Number(est.protein) || 0, fibre: Number(est.fibre) || 0, note: est.note || "", fuelled });
+    await store.set(`meal:${id}`, { id, date: tk, cal: Number(est.cal) || 0, protein: Number(est.protein) || 0, fibre: Number(est.fibre) || 0, note: est.note || "", fuelled });
     setEst(null); setThumb(null); setFuelled(false); reload();
   };
   const saveManual = async () => {
-    if (!mForm.protein && !mForm.fibre) return;
+    if (!mForm.protein && !mForm.fibre && !mForm.cal) return;
     const id = Date.now();
-    await store.set(`meal:${id}`, { id, date: tk, protein: Number(mForm.protein) || 0, fibre: Number(mForm.fibre) || 0, note: mForm.note || (lang === "en" ? "manual" : "手动"), fuelled: mForm.fuelled });
-    setMForm({ protein: "", fibre: "", note: "", fuelled: false }); setManual(false); reload();
+    await store.set(`meal:${id}`, { id, date: tk, cal: Number(mForm.cal) || 0, protein: Number(mForm.protein) || 0, fibre: Number(mForm.fibre) || 0, note: mForm.note || (lang === "en" ? "manual" : "手动"), fuelled: mForm.fuelled });
+    setMForm({ protein: "", fibre: "", cal: "", note: "", fuelled: false }); setManual(false); reload();
   };
-  const startEdit = m => setEditMeal({ id: m.id, date: m.date, protein: m.protein ?? "", fibre: m.fibre ?? "", note: m.note ?? "", fuelled: !!m.fuelled });
+  const startEdit = m => setEditMeal({ id: m.id, date: m.date, cal: m.cal ?? "", protein: m.protein ?? "", fibre: m.fibre ?? "", note: m.note ?? "", fuelled: !!m.fuelled });
   const saveEdit = async () => {
     const e = editMeal;
-    await store.set(`meal:${e.id}`, { id: e.id, date: e.date, protein: Number(e.protein) || 0, fibre: Number(e.fibre) || 0, note: e.note || "", fuelled: e.fuelled });
+    await store.set(`meal:${e.id}`, { id: e.id, date: e.date, cal: Number(e.cal) || 0, protein: Number(e.protein) || 0, fibre: Number(e.fibre) || 0, note: e.note || "", fuelled: e.fuelled });
     setEditMeal(null); reload();
   };
 
   const todayMeals = meals.filter(m => m.date === tk);
+  const cSum = todayMeals.reduce((s, m) => s + (Number(m.cal) || 0), 0);
   const pSum = todayMeals.reduce((s, m) => s + (Number(m.protein) || 0), 0);
   const fSum = todayMeals.reduce((s, m) => s + (Number(m.fibre) || 0), 0);
 
@@ -1159,6 +1204,7 @@ function DietPage({ tk, meals, history, reload, proteinTarget, fibreTarget, prof
         </div>
         {manual && (
           <div className="hs-est">
+            <Num label={L.kcalG} v={mForm.cal} onChange={v => setMForm(f => ({ ...f, cal: v }))} />
             <div className="hs-row2">
               <Num label={L.proteinG} v={mForm.protein} onChange={v => setMForm(f => ({ ...f, protein: v }))} />
               <Num label={L.fibreG} v={mForm.fibre} onChange={v => setMForm(f => ({ ...f, fibre: v }))} />
@@ -1172,6 +1218,7 @@ function DietPage({ tk, meals, history, reload, proteinTarget, fibreTarget, prof
         {analyzing && <p className="hs-muted-sm">{L.analyzing}</p>}
         {est && (
           <div className="hs-est">
+            <div className="hs-est-row"><b>{L.kcal}</b><span>~{est.cal ?? 0} kcal</span></div>
             <div className="hs-est-row"><b>{L.protein}</b><span>~{est.protein} g</span></div>
             <div className="hs-est-row"><b>{L.fibre}</b><span>~{est.fibre ?? 0} g</span></div>
             <p className="hs-muted-sm">{est.note}</p>
@@ -1179,6 +1226,10 @@ function DietPage({ tk, meals, history, reload, proteinTarget, fibreTarget, prof
             <button className="hs-btn primary" onClick={saveMeal}><Check size={15} />{L.saveMeal}</button>
           </div>
         )}
+        <div className="hs-caltot">
+          <span>{L.todayCal} <b>{cSum}</b> kcal</span>
+          <span className="hs-muted-sm">{L.calRef}</span>
+        </div>
         <div className="hs-bar">
           <div className="hs-bar-fill" style={{ width: Math.min(100, proteinTarget ? pSum / proteinTarget * 100 : 0) + "%" }} />
           <span className="hs-bar-t">{L.todayProtein} {pSum}/{proteinTarget}g</span>
@@ -1191,6 +1242,7 @@ function DietPage({ tk, meals, history, reload, proteinTarget, fibreTarget, prof
           {todayMeals.map(m => (
             editMeal && editMeal.id === m.id ? (
               <div key={m.id} className="hs-est">
+                <Num label={L.kcalG} v={editMeal.cal} onChange={v => setEditMeal(s => ({ ...s, cal: v }))} />
                 <div className="hs-row2">
                   <Num label={L.proteinG} v={editMeal.protein} onChange={v => setEditMeal(s => ({ ...s, protein: v }))} />
                   <Num label={L.fibreG} v={editMeal.fibre} onChange={v => setEditMeal(s => ({ ...s, fibre: v }))} />
@@ -1205,7 +1257,7 @@ function DietPage({ tk, meals, history, reload, proteinTarget, fibreTarget, prof
               </div>
             ) : (
               <div key={m.id} className="hs-li">
-                <span>{m.protein}g {L.protein2}{m.fibre ? ` · ${m.fibre}g ${L.fibre2}` : ""}{m.fuelled ? " · " + L.fuelled + "✓" : ""}</span>
+                <span>{m.cal ? `${m.cal} kcal · ` : ""}{m.protein}g {L.protein2}{m.fibre ? ` · ${m.fibre}g ${L.fibre2}` : ""}{m.fuelled ? " · " + L.fuelled + "✓" : ""}</span>
                 <span className="hs-li-r">{m.note?.slice(0, 14)}
                   <Pencil size={13} onClick={() => startEdit(m)} />
                   <Trash2 size={13} onClick={() => delEntry("meal", m.id)} /></span>
@@ -1233,8 +1285,8 @@ function DietPage({ tk, meals, history, reload, proteinTarget, fibreTarget, prof
         <ChartWrap>
           <LineChart data={dietData}>
             <CartesianGrid stroke={C.line} vertical={false} />
-            <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis tick={{ fontSize: 10, fill: C.ink }} />
-            <Tooltip /><Legend wrapperStyle={{ fontSize: 11 }} />
+            <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis tick={{ fontSize: 11, fill: C.ink }} />
+            <Tooltip /><Legend wrapperStyle={{ fontSize: 12 }} />
             <ReferenceLine y={proteinTarget} stroke={C.pine} strokeDasharray="4 4" />
             <ReferenceLine y={fibreTarget} stroke={C.clay} strokeDasharray="4 4" />
             <Line dataKey="protein" name={L.protein} stroke={C.pine} strokeWidth={2} dot={false} connectNulls />
@@ -1299,6 +1351,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
 
   const plan = buildWeekPlan(profile);
   const [editPlan, setEditPlan] = useState(false);
+  const [briefOpen, setBriefOpen] = useState(false);
   const [pdays, setPdays] = useState(DEFAULT_PLAN);
   useEffect(() => {
     setPdays((Array.isArray(profile?.planDays) && profile.planDays.length === 7) ? profile.planDays : DEFAULT_PLAN);
@@ -1325,6 +1378,62 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
     saveProfile({ ...profile, planDays: plan });
     setLoadingCoach(false);
   };
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshMsg, setRefreshMsg] = useState("");
+  const refreshAnalysis = async () => {
+    setRefreshing(true); setRefreshMsg("");
+    try {
+      const r = await fetch("/api/weekly");
+      const j = await r.json();
+      if (j?.note) setCoachNote(j.note);
+      setRefreshMsg(j?.cooled ? L.refreshCooled(j.minutes_left) : (j?.ok ? L.refreshDone : L.refreshFail));
+    } catch { setRefreshMsg(L.refreshFail); }
+    setRefreshing(false);
+  };
+
+  /* ---- ask the coach about THIS plan (text advice only) ---- */
+  const [planChat, setPlanChat] = useState([]);
+  const [planAsking, setPlanAsking] = useState(false);
+  const [planQ, setPlanQ] = useState("");
+  async function askPlan(raw) {
+    const question = (raw || "").trim();
+    if (!question || planAsking) return;
+    setPlanAsking(true);
+    const prior = planChat;
+    setPlanChat(c => [...c, { role: "user", text: question }]);
+    try {
+      const planStr = plan.rows.map(r => { const t = planText(r, L); return `${L.dow[r.idx]}: ${t.name} · ${t.tgt}`; }).join("\n");
+      const recent = (trainings || []).slice(-7).map(t => `${t.date} ${enumLabel(TRAIN_TYPES, t.type, lang)}${t.km ? " " + t.km + "km" : ""}${t.duration ? " " + t.duration + "min" : ""}`).join("\n");
+      const cyc = profile?.cycleStart ? `${lang === "en" ? "Cycle start" : "周期起点"} ${profile.cycleStart}` : "";
+      const primer = (lang === "en" ? "Current weekly plan:\n" : "当前每周计划:\n") + planStr
+        + (recent ? (lang === "en" ? "\n\nRecent training:\n" : "\n\n最近训练:\n") + recent : "")
+        + (cyc ? "\n\n" + cyc : "");
+      const validTypes = ["z2", "long", "quality", "strength", "pilates", "rest"];
+      const sys = lang === "en"
+        ? "You are the user's personal running coach (Attia healthspan + Stacy Sims female physiology), training her healthily for a sub-4h marathon on 2026-09-13. Weekly hard rules: >=2 strength (one upper, one lower, on separate days); <=3 runs (one hard = interval OR tempo, one long, one easy); >=1 pilates; <=1 full rest day; long run only on Sat/Sun. She asks about or points out problems in the plan above. Return JSON ONLY, no other text: {\"reply\":\"short spoken advice — say which day you changed and why\",\"plan\":[7 items Mon..Sun] or null}. Only include plan when she wants the schedule changed; otherwise null. Each item is {\"type\":\"z2|long|quality|strength|pilates|rest\",\"note\":\"short note\"}. Change only what she asked, keep the other days as-is, and obey every rule."
+        : "你是用户的私人跑步教练(融合 Attia 健康寿命 + Stacy Sims 女性生理),帮她健康备战 2026-09-13 全马(目标进 4 小时)。每周硬规则:至少 2 次力量(一次上半身、一次下半身,分不同天);跑步最多 3 次(一次冲刺=间歇或 Tempo、一次长距离、一次轻松);至少 1 次普拉提;最多 1 天完全休息;长距离只放周六/周日。她会针对上面这份计划提问或指出问题。只返回 JSON,不要其他文字:{\"reply\":\"给她的口语建议,简短具体,说你改了哪天、为什么\",\"plan\":[周一..周日共 7 项] 或 null}。只有当她要调整计划时才给 plan,否则为 null。每项是 {\"type\":\"z2|long|quality|strength|pilates|rest\",\"note\":\"简短中文备注\"}。只改她要改的,其余天保持原样,遵守她所有硬规则。"
+        + (profile?.coachPrompt ? "用户额外要求(优先满足,只要安全):" + profile.coachPrompt : "");
+      const msgs = [
+        { role: "user", content: primer },
+        { role: "assistant", content: lang === "en" ? "Got it — what do you want to adjust?" : "好的,你想怎么调?" },
+        ...prior.map(m => ({ role: m.role, content: m.text })),
+        { role: "user", content: question },
+      ];
+      const out = await callClaude(msgs, sys, 800);
+      const j = parseJSON(out);
+      let reply = (j && typeof j.reply === "string" && j.reply) ? j.reply : (out || "…");
+      const np = j?.plan;
+      if (Array.isArray(np) && np.length === 7 && np.every(d => d && validTypes.includes(d.type))) {
+        const clean = np.map(d => ({ type: d.type, note: typeof d.note === "string" ? d.note : "" }));
+        saveProfile({ ...profile, planDays: clean });
+        reply += " " + L.planUpdated;
+      }
+      setPlanChat(c => [...c, { role: "assistant", text: reply }]);
+    } catch {
+      setPlanChat(c => [...c, { role: "assistant", text: lang === "en" ? "Can't reach AI right now." : "暂时连不上 AI(检查网络/API key)。" }]);
+    }
+    setPlanAsking(false);
+  }
 
   return (
     <>
@@ -1336,7 +1445,14 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
             {plan.taper ? <span className="hs-opt"> · {L.taperTag}</span> : null}
           </SectionTitle>
           {!profile?.eventDate && <p className="hs-muted-sm">{L.planNeedDate}</p>}
-          {coachNote && <p className="hs-brief">{coachNote}</p>}
+          {coachNote && (
+            <>
+              <button className="hs-plan-toggle" onClick={() => setBriefOpen(o => !o)}>
+                {briefOpen ? L.briefHide : L.briefShow}
+              </button>
+              {briefOpen && <p className="hs-brief">{coachNote}</p>}
+            </>
+          )}
           {editPlan ? (
             <>
               {pdays.map((d, i) => (
@@ -1369,9 +1485,28 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
                 <Num label={L.planPeak} v={profile?.planPeakKm ?? 30} onChange={v => saveProfile({ ...profile, planPeakKm: v })} />
               </div>
               <p className="hs-muted-sm">{L.planAutoNote}</p>
+              <button className="hs-btn primary" onClick={refreshAnalysis} disabled={refreshing}><Sparkles size={14} />{refreshing ? L.refreshingWk : L.refreshAnalysis}</button>
+              {refreshMsg && <p className="hs-muted-sm">{refreshMsg}</p>}
               <div className="hs-row2">
                 <button className="hs-btn" onClick={loadCoachPlan} disabled={loadingCoach}><RotateCcw size={14} />{loadingCoach ? L.coaching : L.loadCoach}</button>
                 <button className="hs-btn ghost" onClick={() => setEditPlan(true)}><Pencil size={13} />{L.editPlan}</button>
+              </div>
+              {planChat.map((m, i) => (
+                <p key={i} className={m.role === "user" ? "hs-ask-q" : "hs-ask-a"}>
+                  <b>{m.role === "user" ? L.askYou : L.askCoachLbl}</b>{m.text}
+                </p>
+              ))}
+              {planChat.length > 0 && !planAsking && (
+                <button className="hs-plan-toggle" onClick={() => setPlanChat([])}>{L.clearChat}</button>
+              )}
+              {planAsking && <p className="hs-muted-sm">{L.coaching}</p>}
+              <div className="hs-askbox">
+                <input className="hs-input" placeholder={L.planAskPh} value={planQ}
+                  onChange={e => setPlanQ(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter") { askPlan(planQ); setPlanQ(""); } }} />
+                <button className="hs-btn" onClick={() => { askPlan(planQ); setPlanQ(""); }} disabled={planAsking}>
+                  <Sparkles size={14} />{L.askSend}
+                </button>
               </div>
             </>
           )}
@@ -1428,7 +1563,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
                 <ChartWrap>
                   <LineChart data={runSeries}>
                     <CartesianGrid stroke={C.line} vertical={false} />
-                    <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis domain={["auto", "auto"]} reversed tick={{ fontSize: 10, fill: C.ink }} />
+                    <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis domain={["auto", "auto"]} reversed tick={{ fontSize: 11, fill: C.ink }} />
                     <Tooltip />
                     <Line dataKey="pace" name={L.paceTitle} stroke={C.pine} strokeWidth={2} dot={{ r: 2 }} connectNulls />
                   </LineChart>
@@ -1440,7 +1575,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
                 <ChartWrap>
                   <LineChart data={runSeries}>
                     <CartesianGrid stroke={C.line} vertical={false} />
-                    <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis domain={["auto", "auto"]} tick={{ fontSize: 10, fill: C.ink }} />
+                    <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis domain={["auto", "auto"]} tick={{ fontSize: 11, fill: C.ink }} />
                     <Tooltip />
                     <Line dataKey="hr" name={L.runHrTitle} stroke={C.clay} strokeWidth={2} dot={{ r: 2 }} connectNulls />
                   </LineChart>
@@ -1451,7 +1586,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
                 <ChartWrap>
                   <LineChart data={runSeries}>
                     <CartesianGrid stroke={C.line} vertical={false} />
-                    <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis domain={["auto", "auto"]} tick={{ fontSize: 10, fill: C.ink }} />
+                    <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis domain={["auto", "auto"]} tick={{ fontSize: 11, fill: C.ink }} />
                     <Tooltip />
                     <Line dataKey="ef" name={L.efTitle} stroke="#6b8f7a" strokeWidth={2} dot={{ r: 2 }} connectNulls />
                   </LineChart>
@@ -1463,7 +1598,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
                 <ChartWrap>
                   <BarChart data={runSeries}>
                     <CartesianGrid stroke={C.line} vertical={false} />
-                    <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis tick={{ fontSize: 10, fill: C.ink }} />
+                    <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis tick={{ fontSize: 11, fill: C.ink }} />
                     <Tooltip />
                     <Bar dataKey="km" fill={C.amber} radius={[3, 3, 0, 0]} />
                   </BarChart>
@@ -1494,8 +1629,8 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
                 <ChartWrap>
                   <LineChart data={lmSeries}>
                     <CartesianGrid stroke={C.line} vertical={false} />
-                    <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis tick={{ fontSize: 10, fill: C.ink }} />
-                    <Tooltip /><Legend wrapperStyle={{ fontSize: 11 }} />
+                    <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis tick={{ fontSize: 11, fill: C.ink }} />
+                    <Tooltip /><Legend wrapperStyle={{ fontSize: 12 }} />
                     <ReferenceLine y={0} stroke={C.line} />
                     <Line dataKey="fitness" name={L.mFitness} stroke={C.clay} strokeWidth={2} dot={false} />
                     <Line dataKey="fatigue" name={L.mFatigue} stroke="#9a968c" strokeWidth={2} dot={false} />
@@ -1512,7 +1647,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
                 <ChartWrap>
                   <LineChart data={efData}>
                     <CartesianGrid stroke={C.line} vertical={false} />
-                    <XAxis dataKey="x" tick={{ fontSize: 10, fill: C.ink }} /><YAxis domain={["auto", "auto"]} tick={{ fontSize: 10, fill: C.ink }} />
+                    <XAxis dataKey="x" tick={{ fontSize: 11, fill: C.ink }} /><YAxis domain={["auto", "auto"]} tick={{ fontSize: 11, fill: C.ink }} />
                     <Tooltip />
                     <Line dataKey="ef" name={L.efTitle} stroke={C.pine} strokeWidth={2} dot={{ r: 2 }} connectNulls />
                   </LineChart>
@@ -1541,8 +1676,8 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
             <SectionTitle>{L.weekMix}</SectionTitle>
             <ChartWrap>
               <BarChart data={mix} layout="vertical">
-                <XAxis type="number" tick={{ fontSize: 10, fill: C.ink }} />
-                <YAxis type="category" dataKey="name" width={64} tick={{ fontSize: 10, fill: C.ink }} />
+                <XAxis type="number" tick={{ fontSize: 11, fill: C.ink }} />
+                <YAxis type="category" dataKey="name" width={64} tick={{ fontSize: 11, fill: C.ink }} />
                 <Tooltip /><Bar dataKey="min" radius={[0, 3, 3, 0]}>
                   {mix.map((_, i) => <Cell key={i} fill={[C.pine, C.amber, C.clay, C.ink, "#7A8C7E"][i % 5]} />)}
                 </Bar>
@@ -1593,6 +1728,11 @@ function GoalsCard({ profile, saveProfile }) {
         <Num label={L.proteinPerKg} v={p?.proteinPerKg} onChange={v => set("proteinPerKg", v)} step="0.1" />
       </div>
       <Num label={L.fibreTarget} v={p?.fibreTarget ?? 35} onChange={v => set("fibreTarget", v)} />
+      <div className="hs-row2">
+        <Num label={L.hrvBaseL} v={p?.hrvBase} onChange={v => set("hrvBase", v)} />
+        <Num label={L.rhrBaseL} v={p?.rhrBase} onChange={v => set("rhrBase", v)} />
+      </div>
+      <p className="hs-muted-sm">{L.baselineNote}</p>
       <p className="hs-muted-sm">{L.proteinTargetTxt} <b>{target} {L.perDay}</b></p>
       <button className="hs-btn primary" onClick={() => saveProfile(p)}><Check size={15} />{L.saveGoals}</button>
     </Card>
@@ -1636,6 +1776,7 @@ function SupplementCard({ tk, profile, saveProfile }) {
   const list = (profile?.supplements && profile.supplements.length) ? profile.supplements : DEFAULT_SUPP_KEYS;
   const [taken, setTaken] = useState({});
   const [edit, setEdit] = useState(false);
+  const [draft, setDraft] = useState([]);
   const [newName, setNewName] = useState("");
   useEffect(() => { (async () => setTaken((await store.get(`supp:${tk}`)) || {}))(); }, [tk]);
 
@@ -1643,44 +1784,60 @@ function SupplementCard({ tk, profile, saveProfile }) {
     const next = { ...taken, [name]: !taken[name] };
     setTaken(next); await store.set(`supp:${tk}`, next);
   };
-  const addSupp = () => {
-    const n = newName.trim(); if (!n || list.includes(n)) { setNewName(""); return; }
-    saveProfile({ ...profile, supplements: [...list, n] }); setNewName("");
+  const startEdit = () => { setDraft(list.map(s => enumLabel(SUPP_PRESETS, s, lang))); setEdit(true); };
+  const setItem = (i, v) => setDraft(a => a.map((s, j) => (j === i ? v : s)));
+  const removeItem = i => setDraft(a => a.filter((_, j) => j !== i));
+  const addItem = name => {
+    const n = (name || "").trim(); if (!n || draft.includes(n)) { setNewName(""); return; }
+    setDraft(a => [...a, n]); setNewName("");
   };
-  const removeSupp = name => saveProfile({ ...profile, supplements: list.filter(s => s !== name) });
+  const saveEdit = () => {
+    const seen = new Set(); const uniq = [];
+    for (const s of draft.map(x => x.trim()).filter(Boolean)) { if (!seen.has(s)) { seen.add(s); uniq.push(s); } }
+    saveProfile({ ...profile, supplements: uniq }); setEdit(false);
+  };
   const done = list.filter(s => taken[s]).length;
-  const suggestible = SUGGESTED_SUPP_KEYS.filter(s => !list.includes(s));
+  const suggestible = SUGGESTED_SUPP_KEYS.filter(s => !draft.includes(enumLabel(SUPP_PRESETS, s, lang)) && !draft.includes(s));
 
   return (
     <Card>
       <SectionTitle>{L.supps} <span className="hs-opt">{done}/{list.length}</span></SectionTitle>
-      <div className="hs-supps">
-        {list.map(s => (
-          <label key={s} className={"hs-supp" + (taken[s] ? " on" : "")}>
-            <input type="checkbox" checked={!!taken[s]} onChange={() => toggle(s)} />
-            <span>{enumLabel(SUPP_PRESETS, s, lang)}</span>
-            {edit && <Trash2 size={13} onClick={e => { e.preventDefault(); removeSupp(s); }} />}
-          </label>
-        ))}
-      </div>
-      {edit && (
+      {edit ? (
         <>
+          {draft.map((s, i) => (
+            <div key={i} className="hs-supp-edit">
+              <input className="hs-input" value={s} onChange={e => setItem(i, e.target.value)} />
+              <Trash2 size={15} onClick={() => removeItem(i)} />
+            </div>
+          ))}
           {suggestible.length > 0 && (
             <div className="hs-supp-sugg">
               {suggestible.map(s => (
                 <button key={s} className="hs-chip-add"
-                  onClick={() => saveProfile({ ...profile, supplements: [...list, s] })}>＋ {enumLabel(SUPP_PRESETS, s, lang)}</button>
+                  onClick={() => addItem(enumLabel(SUPP_PRESETS, s, lang))}>＋ {enumLabel(SUPP_PRESETS, s, lang)}</button>
               ))}
             </div>
           )}
           <div className="hs-row2" style={{ marginTop: 8 }}>
             <input className="hs-input" placeholder={L.otherFill} value={newName}
-              onChange={e => setNewName(e.target.value)} onKeyDown={e => e.key === "Enter" && addSupp()} />
-            <button className="hs-btn" onClick={addSupp}><Plus size={15} />{L.add}</button>
+              onChange={e => setNewName(e.target.value)} onKeyDown={e => e.key === "Enter" && addItem(newName)} />
+            <button className="hs-btn" onClick={() => addItem(newName)}><Plus size={15} />{L.add}</button>
           </div>
+          <button className="hs-btn-link" onClick={saveEdit}>{L.done}</button>
+        </>
+      ) : (
+        <>
+          <div className="hs-supps">
+            {list.map(s => (
+              <label key={s} className={"hs-supp" + (taken[s] ? " on" : "")}>
+                <input type="checkbox" checked={!!taken[s]} onChange={() => toggle(s)} />
+                <span>{enumLabel(SUPP_PRESETS, s, lang)}</span>
+              </label>
+            ))}
+          </div>
+          <button className="hs-btn-link" onClick={startEdit}>{L.editList}</button>
         </>
       )}
-      <button className="hs-btn-link" onClick={() => setEdit(e => !e)}>{edit ? L.done : L.editList}</button>
     </Card>
   );
 }
@@ -1997,14 +2154,14 @@ function Style() {
 }
 .hs-load{padding:60px;text-align:center;color:var(--soft)}
 .hs-head{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:18px}
-.hs-kicker{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.22em;text-transform:uppercase;color:var(--soft)}
-.hs-title{font-family:'Fraunces',serif;font-weight:500;font-size:28px;margin:2px 0 0;letter-spacing:-.01em}
+.hs-kicker{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--soft)}
+.hs-title{font-family:'Fraunces',serif;font-weight:500;font-size:29px;margin:2px 0 0;letter-spacing:-.01em}
 .hs-phase{text-align:right;line-height:1.1}
-.hs-phase-day{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--pine);display:block}
-.hs-phase-name{font-size:12px;color:var(--soft)}
+.hs-phase-day{font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--pine);display:block}
+.hs-phase-name{font-size:13px;color:var(--soft)}
 .hs-nav{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:13px;padding:4px;margin-bottom:18px;flex-wrap:wrap}
 .hs-tab{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;border:0;background:transparent;color:var(--soft);
-  font-family:inherit;font-size:13px;font-weight:500;padding:9px 8px;border-radius:9px;cursor:pointer;transition:.15s;min-width:64px}
+  font-family:inherit;font-size:14px;font-weight:500;padding:9px 8px;border-radius:9px;cursor:pointer;transition:.15s;min-width:64px}
 .hs-tab:hover{color:var(--ink)}
 .hs-tab.on{background:var(--ink);color:var(--paper)}
 .hs-main{}
@@ -2012,92 +2169,96 @@ function Style() {
 .hs-card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 1px 0 rgba(0,0,0,.02)}
 .hs-card.span2{grid-column:1/-1}
 @media(max-width:640px){.hs-grid{grid-template-columns:1fr}.hs-card.span2{grid-column:1}}
-.hs-sec{font-family:'Fraunces',serif;font-weight:500;font-size:16px;margin:0 0 12px;display:flex;align-items:baseline;gap:8px}
-.hs-req{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.1em;color:var(--clay);text-transform:uppercase}
-.hs-opt{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.05em;color:var(--soft);text-transform:uppercase}
+.hs-sec{font-family:'Fraunces',serif;font-weight:500;font-size:17px;margin:0 0 12px;display:flex;align-items:baseline;gap:8px}
+.hs-req{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.1em;color:var(--clay);text-transform:uppercase}
+.hs-opt{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.05em;color:var(--soft);text-transform:uppercase}
 .hs-ready{display:flex;gap:20px;align-items:center}
 .hs-dial{width:104px;height:104px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0;border:3px solid var(--line)}
 .hs-dial.tone-pine{border-color:var(--pine)} .hs-dial.tone-amber{border-color:var(--amber)} .hs-dial.tone-clay{border-color:var(--clay)}
-.hs-dial-n{font-family:'Fraunces',serif;font-size:38px;font-weight:600;line-height:1}
-.hs-dial-l{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:var(--soft)}
+.hs-dial-n{font-family:'Fraunces',serif;font-size:39px;font-weight:600;line-height:1}
+.hs-dial-l{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--soft)}
 .hs-ready-side{flex:1}
 .hs-chips{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 8px}
-.hs-chip{font-size:11px;font-weight:500;padding:3px 9px;border-radius:20px;border:1px solid var(--line)}
+.hs-chip{font-size:12px;font-weight:500;padding:3px 9px;border-radius:20px;border:1px solid var(--line)}
 .hs-chip.tone-pine{background:#E8EFE9;color:var(--pine);border-color:#CDDBCF}
 .hs-chip.tone-amber{background:#F4EDD9;color:var(--amber);border-color:#E6D9B6}
 .hs-chip.tone-clay{background:#F6E5DA;color:var(--clay);border-color:#EBCBB6}
 .hs-chip.tone-mist{background:#EAF0EA;color:#6E8A72;border-color:#D6E2D7}
 .hs-chip.tone-rust{background:#EEDAD3;color:#8A3D3D;border-color:#DFC2B8}
 .hs-chip.tone-muted,.hs-chip.tone-line{background:transparent;color:var(--soft)}
-.hs-muted-sm{font-size:12px;color:var(--soft);line-height:1.5;margin:6px 0}
-.hs-coach{margin-top:16px;border-top:1px solid var(--line);padding-top:14px;font-size:13.5px;line-height:1.6}
-.hs-coach p{margin:0 0 7px} .hs-coach b{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--pine);margin-right:8px}
+.hs-muted-sm{font-size:13px;color:var(--soft);line-height:1.5;margin:6px 0}
+.hs-coach{margin-top:16px;border-top:1px solid var(--line);padding-top:14px;font-size:14.5px;line-height:1.6}
+.hs-coach p{margin:0 0 7px} .hs-coach b{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--pine);margin-right:8px}
 .hs-coach .flag{color:var(--clay);display:flex;align-items:center;gap:6px;font-weight:500}
 .hs-coach .flag b{display:none}
 .hs-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;width:100%;border:1px solid var(--ink);background:var(--paper);color:var(--ink);
-  font-family:inherit;font-size:13px;font-weight:600;padding:10px;border-radius:10px;cursor:pointer;transition:.15s;margin-top:10px}
+  font-family:inherit;font-size:14px;font-weight:600;padding:10px;border-radius:10px;cursor:pointer;transition:.15s;margin-top:10px}
 .hs-btn:hover{background:var(--ink);color:var(--paper)}
 .hs-btn.primary{background:var(--pine);color:#fff;border-color:var(--pine)}
 .hs-btn.primary:hover{background:#2a4233}
 .hs-btn.ghost{border-style:dashed;color:var(--soft)}
 .hs-btn:disabled{opacity:.5;cursor:default}
-.hs-btn-link{display:block;width:100%;background:none;border:none;color:var(--soft);font-family:inherit;font-size:12px;
+.hs-btn-link{display:block;width:100%;background:none;border:none;color:var(--soft);font-family:inherit;font-size:13px;
   font-weight:500;padding:7px 0 0;cursor:pointer;text-align:center}
 .hs-btn-link:hover{color:var(--pine)}
 .hs-req{margin-top:8px}
 .hs-req textarea{resize:vertical}
 .hs-field{margin-bottom:10px} .hs-field.small{margin-bottom:6px}
-.hs-flab{display:block;font-size:11.5px;color:var(--soft);margin-bottom:4px;font-weight:500}
+.hs-flab{display:block;font-size:12.5px;color:var(--soft);margin-bottom:4px;font-weight:500}
 .hs-sv{font-family:'JetBrains Mono',monospace;color:var(--pine);float:right}
 .hs-input{width:100%;box-sizing:border-box;border:1px solid var(--line);background:var(--paper);border-radius:9px;padding:9px 11px;
-  font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--ink);outline:none}
+  font-family:'JetBrains Mono',monospace;font-size:15px;color:var(--ink);outline:none}
 .hs-input:focus{border-color:var(--pine)}
 select.hs-input{font-family:'Hanken Grotesk',sans-serif}
 .hs-range{width:100%;accent-color:var(--pine)}
 .hs-row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .hs-hm{display:flex;align-items:center;gap:5px}
 .hs-hm .hs-input{text-align:center;padding-left:6px;padding-right:6px}
-.hs-hm-u{font-size:11px;color:var(--soft);font-family:'JetBrains Mono',monospace}
+.hs-hm-u{font-size:12px;color:var(--soft);font-family:'JetBrains Mono',monospace}
 .hs-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;align-items:end}
 .hs-stages{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0}
 .hs-list{margin-top:12px;display:flex;flex-direction:column;gap:6px}
-.hs-li{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;padding:7px 10px;background:var(--paper);border-radius:8px;border:1px solid var(--line)}
-.hs-li-r{display:flex;align-items:center;gap:8px;color:var(--soft);font-family:'JetBrains Mono',monospace;font-size:11px}
+.hs-li{display:flex;justify-content:space-between;align-items:center;font-size:13.5px;padding:7px 10px;background:var(--paper);border-radius:8px;border:1px solid var(--line)}
+.hs-li-r{display:flex;align-items:center;gap:8px;color:var(--soft);font-family:'JetBrains Mono',monospace;font-size:12px}
 .hs-li-r svg{cursor:pointer;color:var(--soft)} .hs-li-r svg:hover{color:var(--clay)}
 .hs-chart{margin-top:4px}
 .hs-photo{margin-bottom:8px}
-.hs-photo-empty{height:120px;border:1.5px dashed var(--line);border-radius:11px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--soft);font-size:12px}
+.hs-photo-empty{height:120px;border:1.5px dashed var(--line);border-radius:11px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--soft);font-size:13px}
 .hs-thumb{width:100%;height:160px;object-fit:cover;border-radius:11px;border:1px solid var(--line)}
 .hs-est{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px}
-.hs-est-row{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}
+.hs-est-row{display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px}
 .hs-est-row b{font-weight:600}
-.hs-check{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--soft);margin:8px 0}
+.hs-check{display:flex;align-items:center;gap:7px;font-size:13.5px;color:var(--soft);margin:8px 0}
+.hs-caltot{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:4px 10px;margin-top:12px;font-size:15px;color:var(--ink)}
+.hs-caltot b{font-size:21px;color:var(--pine);margin:0 2px}
 .hs-bar{position:relative;height:26px;background:var(--paper);border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-top:12px}
 .hs-bar-fill{position:absolute;left:0;top:0;bottom:0;background:#E8EFE9;border-right:2px solid var(--pine)}
 .hs-bar-fill.fibre{background:#F4EDD9;border-right-color:var(--amber)}
-.hs-bar-t{position:relative;display:block;line-height:26px;padding-left:10px;font-size:11.5px;font-family:'JetBrains Mono',monospace;color:var(--ink)}
+.hs-bar-t{position:relative;display:block;line-height:26px;padding-left:10px;font-size:12.5px;font-family:'JetBrains Mono',monospace;color:var(--ink)}
 .hs-range-row{display:flex;gap:6px;flex-wrap:wrap}
-.hs-range-btn{flex:1;min-width:56px;border:1px solid var(--line);background:var(--paper);color:var(--soft);font-family:inherit;font-size:12px;font-weight:600;padding:7px;border-radius:8px;cursor:pointer;transition:.15s}
+.hs-range-btn{flex:1;min-width:56px;border:1px solid var(--line);background:var(--paper);color:var(--soft);font-family:inherit;font-size:13px;font-weight:600;padding:7px;border-radius:8px;cursor:pointer;transition:.15s}
 .hs-range-btn:hover{color:var(--ink)}
 .hs-range-btn.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
 .hs-zonebar{display:flex;height:14px;border-radius:7px;overflow:hidden;margin:10px 0 4px;border:1px solid var(--line)}
 .hs-zonebar span{display:block;min-width:0}
 .hs-zlegend{display:flex;flex-wrap:wrap;gap:7px 14px;margin:8px 0 4px}
-.hs-zleg{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink)}
+.hs-zleg{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--ink)}
 .hs-zleg i{width:10px;height:10px;border-radius:3px;display:inline-block;flex:none}
 .hs-plan{display:flex;flex-direction:column;gap:2px;margin-top:6px}
 .hs-planrow{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:8px}
 .hs-planrow.today{background:#ECE6D8}
-.hs-pday{width:42px;font-size:12px;color:var(--soft)}
+.hs-pday{width:42px;font-size:13px;color:var(--soft)}
 .hs-pdot{width:9px;height:9px;border-radius:50%;flex:none}
 .hs-pdot.t-z2{background:#5C8060}.hs-pdot.t-q{background:#A83D3D}.hs-pdot.t-str{background:#C97B3C}.hs-pdot.t-pil{background:#9BB0A8}.hs-pdot.t-rest{background:#C9C3B5}
 .hs-planedit{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .hs-planedit .hs-input{margin:0}
 .hs-planedit select.hs-input{flex:none;width:92px}
 .hs-planedit input.hs-input{flex:1}
-.hs-pname{flex:1;font-size:13px;color:var(--ink)}
-.hs-ptar{font-size:12px;color:var(--soft)}
-.hs-plan-today{font-size:13px;color:var(--ink);margin:2px 0 4px}
+.hs-pname{flex:1;font-size:14px;color:var(--ink)}
+.hs-ptar{font-size:13px;color:var(--soft)}
+.hs-plan-toggle{width:auto;background:none;border:none;color:var(--soft);font-size:13px;padding:6px 2px;margin-top:2px;cursor:pointer;text-align:left}
+.hs-plan-toggle:hover{color:var(--ink)}
+.hs-plan-today{font-size:14px;color:var(--ink);margin:2px 0 4px}
 .hs-plan-today b{color:var(--pine);margin-right:6px}
 .hs-askbox{display:flex;gap:8px;margin-top:10px;align-items:stretch}
 .hs-askbox .hs-input{margin:0;flex:1 1 auto;min-width:0}
@@ -2106,19 +2267,22 @@ select.hs-input{font-family:'Hanken Grotesk',sans-serif}
 .hs-ask-q b{color:var(--soft);margin-right:4px}
 .hs-ask-a{margin:2px 0 6px;color:var(--ink)}
 .hs-ask-a b{color:var(--pine);margin-right:4px}
-.hs-brief{white-space:pre-wrap;font-size:12.5px;line-height:1.7;color:var(--ink);background:#F0ECE0;border-radius:10px;padding:10px 12px;margin:8px 0 10px}
+.hs-brief{white-space:pre-wrap;font-size:13.5px;line-height:1.7;color:var(--ink);background:#F0ECE0;border-radius:10px;padding:10px 12px;margin:8px 0 10px}
 .hs-supps{display:flex;flex-direction:column;gap:6px;margin-top:4px}
-.hs-supp{display:flex;align-items:center;gap:9px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:var(--paper);font-size:13.5px;cursor:pointer}
+.hs-supp{display:flex;align-items:center;gap:9px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:var(--paper);font-size:14.5px;cursor:pointer}
 .hs-supp.on{background:#E8EFE9;border-color:#CDDBCF;color:var(--pine)}
 .hs-supp input{accent-color:var(--pine)}
 .hs-supp svg{margin-left:auto;color:var(--soft);cursor:pointer}
 .hs-supp-sugg{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.hs-chip-add{border:1px dashed var(--line);background:transparent;color:var(--soft);font-family:inherit;font-size:12px;padding:5px 10px;border-radius:20px;cursor:pointer;transition:.15s}
+.hs-supp-edit{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.hs-supp-edit .hs-input{margin:0;flex:1}
+.hs-supp-edit svg{color:var(--soft);cursor:pointer;flex:none}
+.hs-chip-add{border:1px dashed var(--line);background:transparent;color:var(--soft);font-family:inherit;font-size:13px;padding:5px 10px;border-radius:20px;cursor:pointer;transition:.15s}
 .hs-chip-add:hover{border-color:var(--pine);color:var(--pine);border-style:solid}
 .hs-head-r{display:flex;align-items:center;gap:12px}
-.hs-lang{background:var(--card);border:1px solid var(--line);color:var(--soft);font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;padding:5px 10px;border-radius:8px;cursor:pointer;transition:.15s}
+.hs-lang{background:var(--card);border:1px solid var(--line);color:var(--soft);font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;padding:5px 10px;border-radius:8px;cursor:pointer;transition:.15s}
 .hs-lang:hover{color:var(--ink);border-color:var(--ink)}
-.hs-foot{margin-top:22px;text-align:center;font-size:10.5px;color:var(--soft);line-height:1.6;border-top:1px solid var(--line);padding-top:14px}
-.hs-health-banner{display:flex;align-items:center;gap:6px;margin:0 0 12px;padding:9px 12px;border-radius:10px;background:rgba(46,160,90,.12);border:1px solid rgba(46,160,90,.35);color:#2ea05a;font-size:12.5px;cursor:pointer}
+.hs-foot{margin-top:22px;text-align:center;font-size:11.5px;color:var(--soft);line-height:1.6;border-top:1px solid var(--line);padding-top:14px}
+.hs-health-banner{display:flex;align-items:center;gap:6px;margin:0 0 12px;padding:9px 12px;border-radius:10px;background:rgba(46,160,90,.12);border:1px solid rgba(46,160,90,.35);color:#2ea05a;font-size:13.5px;cursor:pointer}
   `}</style>;
 }

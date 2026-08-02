@@ -5,8 +5,30 @@
 //   { action: "exchange", code }            -> first-time authorization, returns tokens + athlete
 //   { action: "sync", refresh_token, after } -> refreshes token, returns recent activities
 
+import Redis from "ioredis";
+
 const TOKEN_URL = "https://www.strava.com/oauth/token";
 const ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities";
+
+// The Strava refresh token is stripped from the public backup read for security,
+// so a shared client no longer holds it. When a request doesn't carry the token,
+// fall back to reading it server-side from the Redis backup blob (it never leaves
+// the server this way).
+let _redis;
+function redisClient() {
+  if (!_redis && process.env.REDIS_URL) _redis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: false });
+  return _redis;
+}
+async function tokenFromRedis() {
+  try {
+    const c = redisClient();
+    if (!c) return null;
+    const raw = await c.get("backup");
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    return obj?.data?.["hs:strava:refresh"] || null;
+  } catch { return null; }
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -40,11 +62,12 @@ export default async function handler(req, res) {
     }
 
     if (action === "sync") {
-      if (!body.refresh_token) return res.status(400).json({ error: "Missing refresh_token" });
+      const refresh = body.refresh_token || await tokenFromRedis();
+      if (!refresh) return res.status(400).json({ error: "Missing refresh_token" });
       const tok = await postToken({
         client_id: clientId,
         client_secret: clientSecret,
-        refresh_token: body.refresh_token,
+        refresh_token: refresh,
         grant_type: "refresh_token",
       });
       if (tok.errors || !tok.access_token) {

@@ -5,7 +5,19 @@
 // Hardening (a public client app can't hold a real secret, so we do what we can):
 //  - same-origin check: blocks other websites from calling this endpoint
 //  - model whitelist + max_tokens cap: limits the cost of any single call
+//  - rate limit (Redis): caps how many AI calls the URL can make per hour, so a
+//    shared/public link can't be spammed to burn the Anthropic budget
 //  - your prepaid balance + Auto-reload OFF in the Anthropic console caps total damage
+
+import Redis from "ioredis";
+
+let client;
+function getClient() {
+  if (!client) client = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: false });
+  return client;
+}
+
+const RL_MAX = 40; // max AI calls per hour (generous for normal use, blocks abuse)
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -17,6 +29,16 @@ export default async function handler(req, res) {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     return res.status(500).json({ error: "Server is missing ANTHROPIC_API_KEY. Set it in your Vercel project settings." });
+  }
+  // Rate limit AI calls (hourly bucket) so a public link can't burn the budget.
+  if (process.env.REDIS_URL) {
+    try {
+      const redis = getClient();
+      const bucket = "rl:claude:" + Math.floor(Date.now() / 3600000);
+      const n = await redis.incr(bucket);
+      if (n === 1) await redis.expire(bucket, 3700);
+      if (n > RL_MAX) return res.status(429).json({ error: "Too many requests — try again later." });
+    } catch { /* if Redis is unavailable, don't block the app */ }
   }
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
