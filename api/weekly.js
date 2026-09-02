@@ -1,13 +1,14 @@
 // Weekly auto-coach (server-side, always-on). Vercel Cron every Sunday.
-// Reads ALL of Lynn's data (Strava week + sleep + HRV/RHR + diet + body
+// Reads ALL of the user's data (Strava week + sleep + HRV/RHR + diet + body
 // composition + menstrual cycle + supplements + marathon), asks a world-class
 // coach (Attia + Stacy Sims + Huberman synthesis) for next week's plan +
-// holistic briefing, and writes it to the coachplan store. Lynn taps
+// holistic briefing, and writes it to the coachplan store. The user taps
 // 载入教练计划 to apply. No device needs to be on.
 //
 // Env: REDIS_URL, STRAVA_CLIENT_ID/SECRET, ANTHROPIC_API_KEY, CRON_SECRET(optional)
 
 import Redis from "ioredis";
+import { requireAuth } from "../lib/auth.js";
 
 // This function does several sequential Strava fetches + one Anthropic call,
 // which can take well over the default timeout — allow up to 60s (Hobby max).
@@ -16,7 +17,7 @@ export const maxDuration = 60;
 const MODEL = "claude-sonnet-4-6";
 const TOKEN_URL = "https://www.strava.com/oauth/token";
 const ACT_URL = "https://www.strava.com/api/v3/athlete/activities";
-// Lynn's real HR zone edges (max HR ~185): Z1<121 Z2 121-150 Z3 151-165 Z4 166-179 Z5 180+
+// Configured HR zone edges (max HR ~185): Z1<121 Z2 121-150 Z3 151-165 Z4 166-179 Z5 180+
 const EDGES = [120, 150, 165, 179];
 const RACE = "2026-09-13";
 
@@ -33,10 +34,11 @@ const rnd1 = x => x == null ? null : Math.round(x * 10) / 10;
 export default async function handler(req, res) {
   const secret = process.env.CRON_SECRET;
   const hasSecret = secret && ((req.headers.authorization || "") === `Bearer ${secret}` || (req.query?.key || "") === secret);
-  // The Sunday cron (and admin) send the secret. The in-app 「更新本周分析」button
-  // calls this WITHOUT a secret — allowed, but blocked from other sites and
-  // rate-limited (20-min cooldown) below so手滑连点 doesn't burn AI calls.
-  if (secret && !hasSecret && !sameOriginish(req)) return res.status(403).json({ error: "Forbidden" });
+  // The Sunday cron sends CRON_SECRET; the in-app "refresh" button sends the
+  // user's PIN hash. Anything else is refused — this route reads the whole
+  // dataset and spends AI credits.
+  if (!sameOriginish(req)) return res.status(403).json({ error: "Forbidden" });
+  if (!(await requireAuth(req, res))) return;
   if (!process.env.REDIS_URL || !process.env.STRAVA_CLIENT_ID || !process.env.ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: "Missing REDIS_URL / STRAVA creds / ANTHROPIC_API_KEY" });
   }
@@ -49,7 +51,7 @@ export default async function handler(req, res) {
       if (last && Date.now() - last < CD) {
         const raw = await r.get("coachplan");
         const cp = raw ? JSON.parse(raw) : {};
-        return res.status(200).json({ ok: true, cooled: true, minutes_left: Math.ceil((CD - (Date.now() - last)) / 60000), plan: cp.plan || null, note: cp.note || "" });
+        return res.status(200).json({ ok: true, cooled: true, minutes_left: Math.ceil((CD - (Date.now() - last)) / 60000), plan: cp.plan || null, note: cp.note || "", note_en: cp.note_en || "" });
       }
     }
     const today = new Date().toISOString().slice(0, 10);
@@ -80,7 +82,7 @@ export default async function handler(req, res) {
       sleepTotal: okNum(d.sleepTotal, 0, 20),
       deep: okNum(d.deep, 0, 20),
       rem: okNum(d.rem, 0, 20),
-      hrv: okNum(d.hrv, 5, 300),
+      hrv: okNum(d.hrv, 5, 150),
       rhr: okNum(d.rhr, 25, 150),
     }));
     const sleep7 = last14.slice(-7).map(d => ({ date: d.date, hrs: rnd1(Number(d.sleepTotal)), deep: rnd1(Number(d.deep)), rem: rnd1(Number(d.rem)) }));
@@ -204,7 +206,8 @@ export default async function handler(req, res) {
       "把这些聪明地摆进7天:最硬的课(间歇或Tempo/大重量/长距离)放她最新鲜的日子,完全休息与轻松日放她恢复最差的日子;练腿的硬日彼此错开(长距离/间歇/重腿之间夹轻松或上肢或休息);卵泡期可多推力量与强度,黄体期或月经期偏向恢复与补给;长距离【必须】放在周六或周日,绝不放在周一到周五(她周末跑长距离);而且如果 strava_logs / 跑步数据显示她刚在上个周末跑过长距离,那本周的周一【必须】是恢复日(rest 或极轻松),绝不能紧接着再排一次长距离——连续两天长距离是大忌。她也重视一天真正的休息。" +
       "自我调节:HRV明显低于基线、睡眠不足或深睡少、上周长跑掉速、正值经期、或近期负荷过高 → 本周更保守(缩短长距离、把间歇或Tempo那次降为Z2、增加休息或普拉提、强调睡眠与补给);各项良好则稳步推进强度与量。" +
       "每天 note 必须一行、约15-30字,只含心率或配速目标 + 最多一个关键提示(无emoji);详细分析只写在总简报 note 里,绝不要在每天的 note 里写长段落。" +
-      "只返回JSON,无其他文字,格式:{\"plan\":[{\"type\":\"strength|z2|long|quality|pilates|rest\",\"note\":\"...\"} 共7项],\"note\":\"本周简报\"}。" +
+      "所有内容都要中英双语:每天除 note(中文)外再给 note_en(同内容的英文,同样一行简短);总简报除 note(中文)外再给 note_en(忠实对应的英文版,同样的【】分块结构用 [Status]/[Training],同样简洁,不要额外发挥)。" +
+      "只返回JSON,无其他文字,格式:{\"plan\":[{\"type\":\"strength|z2|long|quality|pilates|rest\",\"note\":\"中文\",\"note_en\":\"English\"} 共7项],\"note\":\"本周简报(中文)\",\"note_en\":\"Weekly briefing (English)\"}。" +
       "note 字段是本周简报,以训练决策为轴,分两块,两块之间用两个换行符 \\n\\n 分隔,大标题用【】;整体必须高效简洁、不啰嗦。\\n\\n" +
       "第一块【状态】:用3-5句简洁概括最近一周的睡眠、饮食、周期、恢复(HRV/RHR),只点出会影响本周训练的关键 + 具体数字/目标,不要长篇、不要逐条铺开。\\n\\n" +
       "第二块【训练】(核心):按训练类别分,每类高效讲评上周并说下周怎么提高:\\n" +
@@ -216,7 +219,7 @@ export default async function handler(req, res) {
     const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: MODEL, max_tokens: 4500, system, messages: [{ role: "user", content: "我过去一周的全部数据:\n" + JSON.stringify(summary, null, 2) }] }),
+      body: JSON.stringify({ model: MODEL, max_tokens: 7000, system, messages: [{ role: "user", content: "我过去一周的全部数据:\n" + JSON.stringify(summary, null, 2) }] }),
     });
     const ai = await aiRes.json();
     const text = ai?.content?.[0]?.text || "";
@@ -224,16 +227,16 @@ export default async function handler(req, res) {
     if (!parsed || !Array.isArray(parsed.plan) || parsed.plan.length !== 7) {
       return res.status(502).json({ error: "AI did not return a valid 7-day plan", raw: text.slice(0, 600), summary });
     }
-    const plan = parsed.plan.map(d => ({ type: String(d.type || "rest"), note: String(d.note || "") }));
+    const plan = parsed.plan.map(d => ({ type: String(d.type || "rest"), note: String(d.note || ""), note_en: String(d.note_en || "") }));
     // Hard guardrail: the long run must be on the weekend (Sat=idx5 / Sun=idx6),
     // never Mon-Fri — regardless of what the model returned.
     const li = plan.findIndex(d => d.type === "long");
     if (li >= 0 && li < 5) { const t = plan[5]; plan[5] = plan[li]; plan[li] = t; }
 
     const ts = Date.now();
-    await r.set("coachplan", JSON.stringify({ plan, note: String(parsed.note || ""), ts }));
+    await r.set("coachplan", JSON.stringify({ plan, note: String(parsed.note || ""), note_en: String(parsed.note_en || ""), ts }));
     await r.set("weekly:lastrun", String(ts));
-    return res.status(200).json({ ok: true, ts, summary, note: parsed.note, plan });
+    return res.status(200).json({ ok: true, ts, summary, note: parsed.note, note_en: parsed.note_en || "", plan });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }

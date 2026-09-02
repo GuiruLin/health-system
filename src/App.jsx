@@ -48,10 +48,35 @@ function localHasData() {
   }
   return false;
 }
+/* ================================================================== */
+/*  AUTH — one PIN, hashed in the browser, sent as a bearer token       */
+/* ================================================================== */
+const TOKEN_KEY = PFX + "auth:token";
+const getToken = () => { try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; } };
+const setToken = t => { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch { /* private mode */ } };
+
+// SHA-256 of the PIN. Only this digest is stored or sent — never the PIN.
+async function hashPin(pin) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(pin)));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Every API call goes through here so the token is attached in exactly one place.
+let _onLocked = null;
+export function setLockHandler(fn) { _onLocked = fn; }
+async function api(path, opts = {}) {
+  const token = getToken();
+  const headers = { ...(opts.headers || {}) };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401 && _onLocked) _onLocked();
+  return res;
+}
+
 let _backupTimer = null;
 async function pushBackup() {
   try {
-    await fetch("/api/backup", {
+    await api("/api/backup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ data: snapshotLocal(), ts: Date.now() }),
@@ -66,7 +91,7 @@ function scheduleBackup() {
 async function restoreIfEmpty() {
   if (localHasData()) return false;
   try {
-    const r = await fetch("/api/backup");
+    const r = await api("/api/backup");
     const j = await r.json();
     if (j && j.data && Object.keys(j.data).length) {
       for (const [k, v] of Object.entries(j.data)) {
@@ -117,7 +142,7 @@ function cyclePhase(startDate, length, lang = "zh") {
 // Change this to "claude-opus-4-8" for best quality, or another model id if this one errors.
 const MODEL = "claude-sonnet-4-6";
 async function callClaude(messages, system, maxTokens = 1000) {
-  const res = await fetch("/api/claude", {
+  const res = await api("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model: MODEL, max_tokens: maxTokens, system, messages }),
@@ -146,6 +171,10 @@ function fileToJpegDataUrl(file, maxDim = 1200, quality = 0.85) {
     img.src = url;
   });
 }
+// Physiologically plausible bound — reject corrupt watch/sync readings
+// (e.g. a stray Apple Health HRV of 207ms, ~2x her real range). Returns the
+// number if in [lo,hi], else null.
+const vital = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : null; };
 function parseJSON(text) {
   const clean = (text || "").replace(/```json|```/g, "").trim();
   try { return JSON.parse(clean); } catch { return null; }
@@ -212,7 +241,8 @@ function computeAerobicEfficiency(trainings) {
 }
 
 // Cardio intensity split by average HR vs estimated max HR (from observed data).
-// Absolute HR zone edges matching Lynn's Strava setup (max HR ~185):
+// Absolute heart-rate zone edges, taken from the athlete's configured Strava
+// zones rather than a %-of-max formula (max HR ~185).
 // Z1<121 · Z2 121-150 · Z3 151-165 · Z4 166-179 · Z5 180+
 // Z1 <125 · Z2 125-154 · Z3 155-169 · Z4 170-184 · Z5 185+
 const HR_ZONE_EDGES = [120, 150, 165, 179];
@@ -323,14 +353,158 @@ function planQuality(weeks) {
 }
 // Default weekly structure (Mon..Sun); editable via profile.planDays.
 const DEFAULT_PLAN = [
-  { type: "strength", note: "下肢 · 大重量" },       // 周一
-  { type: "z2", note: "8-10K · 心率130-145" },       // 周二
-  { type: "pilates", note: "Barre · 核心" },         // 周三
-  { type: "quality", note: "5×3min 冲166+" },        // 周四
-  { type: "strength", note: "上半身 + 核心" },        // 周五
-  { type: "long", note: "22K · Z2 负分割" },          // 周六
-  { type: "rest", note: "完全休息" },                 // 周日
+  { type: "strength", note: "下肢 · 大重量", note_en: "Lower body · heavy" },        // 周一
+  { type: "z2", note: "8-10K · 心率130-145", note_en: "8-10K · HR 130-145" },        // 周二
+  { type: "pilates", note: "Barre · 核心", note_en: "Barre · core" },                // 周三
+  { type: "quality", note: "5×3min 冲166+", note_en: "5×3min hit 166+" },            // 周四
+  { type: "strength", note: "上半身 + 核心", note_en: "Upper body + core" },          // 周五
+  { type: "long", note: "22K · Z2 负分割", note_en: "22K · Z2 negative split" },      // 周六
+  { type: "rest", note: "完全休息", note_en: "Full rest" },                           // 周日
 ];
+// ---- Exercise library (4 routines, long-term system) ----
+// Routines as programmed. No mini resistance band available, so that one banded
+// moves swapped for equipment-free equivalents. Warm-up/core videos use
+// coach-locked YouTube searches (first result = that coach's demo), same
+// convention as her Notion pages; main lifts use her verified video links.
+const YTS = q => "https://www.youtube.com/results?search_query=" + q;
+// n/d = Chinese, ne/de = English (shown when the app is in EN; also what the
+// per-routine Copy button produces for pasting into a Strava description).
+const EXLIB = [
+  {
+    key: "lowerA", title: "Lower A · 臀 + 髋铰链 + 肌腱", titleEn: "Lower A · Glutes + Hinge + Tendons",
+    secs: [
+      { name: "热身 · 约8分钟", nameEn: "Warm-up · ~8 min", items: [
+        { n: "单腿臀桥 ×8/侧", ne: "Single-leg glute bridge ×8/side", d: "臀肌激活 + 核心(无短环带,替代弹力带臀桥)", de: "glute activation + core (no mini band)", u: YTS("single+leg+glute+bridge+E3+Rehab") },
+        { n: "怪兽走(弹力带) ×10步/方向", ne: "Monster walk (band) ×10 steps/dir", d: "臀中肌激活", de: "glute med activation", u: YTS("monster+walk+band+lateral") },
+        { n: "髋铰链持杆 ×10 ⭐", ne: "Hip hinge drill (dowel) ×10 ⭐", d: "下肢核心技术点", de: "key movement skill", u: YTS("hip+hinge+drill+dowel+Squat+University") },
+        { n: "死虫式 ×8/侧", ne: "Dead bug ×8/side", d: "核心抗伸展 · 骨盆稳定", de: "anti-extension core", u: YTS("dead+bug+exercise+E3+Rehab") },
+      ]},
+      { name: "主项", nameEn: "Main", items: [
+        { n: "① 杠铃 RDL", ne: "① Barbell RDL", d: "4–6次 ×4组 · 离心3秒 · 45–55kg总重(首两周45起)", de: "4–6 ×4 · 3s ecc · 45–55kg total (start 45)", u: "https://www.youtube.com/watch?v=aa57T45iFSE", s: "4–6×4 · 45–55kg" },
+        { n: "② 杠铃臀桥", ne: "② Barbell hip thrust", d: "8–12次 ×3–4组 · 40–60kg总重(首两周40起)", de: "8–12 ×3–4 · 40–60kg total (start 40)", u: "https://www.youtube.com/watch?v=S_uZP4UH6J0", s: "8–12×3–4 · 40–60kg" },
+        { n: "③ 北欧腘绳挑", ne: "③ Nordic hamstring curl", d: "4–8次 ×3组 · 自重 · 必要时手撑辅助", de: "4–8 ×3 · BW, hand-assist as needed", u: "https://www.youtube.com/watch?v=_e9vFU9-tkc", s: "4–8×3" },
+        { n: "④ 单腿 RDL", ne: "④ Single-leg RDL", d: "8–10/侧 ×3组 · 离心3秒 · 10–14kg", de: "8–10/side ×3 · 3s ecc · 10–14kg", u: "https://www.youtube.com/watch?v=Zfr6wizR8rs", s: "8–10/side ×3 · 10–14kg" },
+        { n: "⑤ 侧卧髋外展", ne: "⑤ Side-lying hip abduction", d: "12–15/侧 ×3组 · 徒手→2–4kg", de: "12–15/side ×3 · BW→2–4kg", u: "https://www.youtube.com/watch?v=9dJVwNzbH7s", s: "12–15/side ×3" },
+      ]},
+      { name: "收尾 · 核心抗伸展", nameEn: "Finisher · Anti-extension core", items: [
+        { n: "死虫式 或 RKC 平板", ne: "Dead bug or RKC plank", d: "3组 ×20–40秒", de: "3 ×20–40s", u: YTS("rkc+plank+form"), s: "3×20–40s" },
+      ]},
+    ],
+  },
+  {
+    key: "lowerB", title: "Lower B · 股四 + 侧向 + 爆发", titleEn: "Lower B · Quads + Lateral + Power",
+    secs: [
+      { name: "热身 · 约8分钟", nameEn: "Warm-up · ~8 min", items: [
+        { n: "World's Greatest Stretch ×5/侧", ne: "World's Greatest Stretch ×5/side", d: "动态开髋", de: "dynamic hip opener", u: YTS("worlds+greatest+stretch") },
+        { n: "Pogo 原地小跳 ×20", ne: "Pogo hops ×20", d: "神经唤醒 + 踝刚性", de: "neural primer + ankle stiffness", u: YTS("pogo+hops+plyometric") },
+        { n: "侧桥 + 上腿外展 ×6–8/侧", ne: "Side plank + hip abduction ×6–8/side", d: "臀中肌激活最高的徒手动作 · 兼抗侧屈核心", de: "top glute-med activation + lateral core", u: "https://www.youtube.com/watch?v=ZR84WQVhdIE" },
+      ]},
+      { name: "主项(爆发放最前,神经最清醒时)", nameEn: "Main (power first, while fresh)", items: [
+        { n: "① 跳箱", ne: "① Box jump", d: "3–4次 ×3–5组 · 自重 · 落地质量优先,备赛期不加量", de: "3–4 ×3–5 · BW · land quality first", u: "https://www.youtube.com/watch?v=G-bxQY57mKc", s: "3–4×3–5" },
+        { n: "② 高脚杯深蹲(宽站距)", ne: "② Goblet squat (wide stance)", d: "6–10次 ×3–4组 · 离心3秒 · 12→16–20kg", de: "6–10 ×3–4 · 3s ecc · 12→16–20kg", u: "https://www.youtube.com/watch?v=sRoJxNrfykI", s: "6–10×3–4 · 20kg" },
+        { n: "③ 哥萨克蹲", ne: "③ Cossack squat", d: "6–8/侧 ×3组 · 徒手起步→8–12kg", de: "6–8/side ×3 · BW→8–12kg", u: "https://www.youtube.com/watch?v=gfod3jiMgl4", s: "6–8/side ×3 · 12kg" },
+        { n: "④ 保加利亚分腿蹲", ne: "④ Bulgarian split squat", d: "8–10/侧 ×3组 · 离心3秒 · 8→10–12kg/手", de: "8–10/side ×3 · 3s ecc · 8→10–12kg/hand", u: "https://www.youtube.com/watch?v=-4LVK1crLSw", s: "8–10/side ×3 · 10kg/hand" },
+        { n: "⑤ 哥本哈根平板", ne: "⑤ Copenhagen plank", d: "10–20秒/侧 ×3组 · 首周膝支撑短杠杆、10秒起", de: "10–20s/side ×3 · start short lever", u: "https://www.youtube.com/watch?v=YRRnnZsRs9U", s: "10–20s/side ×3" },
+        { n: "⑥ 提踵(等长+慢离心)", ne: "⑥ Calf raise (iso + slow ecc)", d: "8–10次 ×3组 · 顶端停2秒+3秒放下 · 自重→单腿→持铃", de: "8–10 ×3 · 2s hold + 3s down · BW→single-leg→loaded", u: "https://www.youtube.com/watch?v=HmgXnST4Mdw", s: "8–10×3 · 2s hold + 3s down" },
+      ]},
+      { name: "收尾 · 核心旋转爆发", nameEn: "Finisher · Rotational power core", items: [
+        { n: "绳索木砍(爆发式)", ne: "Cable wood chop (explosive)", d: "10/侧 ×3组 · 当前25kg · 转出去快、收回来慢控制", de: "10/side ×3 · current 25kg · fast out, controlled return", u: "https://www.youtube.com/watch?v=pAplQXk3dkU", s: "10/side ×3 · 25kg" },
+      ]},
+    ],
+  },
+  {
+    key: "upperA", title: "Upper A · 水平推拉", titleEn: "Upper A · Horizontal Push/Pull",
+    secs: [
+      { name: "热身 · 约6分钟", nameEn: "Warm-up · ~6 min", items: [
+        { n: "泡沫轴胸椎伸展 ×8", ne: "Foam roller T-spine extension ×8", d: "松开中背", de: "", u: YTS("thoracic+extension+foam+roller+Squat+University") },
+        { n: "Hooklying Arm Glides ×8", ne: "Hooklying arm glides ×8", d: "锁肩", de: "packed shoulder", u: "https://www.youtube.com/watch?v=78PqDfCiC34" },
+        { n: "地板滑动 ×10", ne: "Floor slides ×10", d: "下斜方 + 前锯肌", de: "lower traps + serratus", u: YTS("floor+slides+scapular+E3+Rehab") },
+        { n: "弹力带分拉 ×15", ne: "Band pull-aparts ×15", d: "后三角 + 菱形肌", de: "rear delts + rhomboids", u: YTS("band+pull+apart+Athlean+X") },
+      ]},
+      { name: "主项", nameEn: "Main", items: [
+        { n: "① 地板卧推", ne: "① Floor press", d: "8–12次 ×3–4组 · 离心3秒 · 7.5→9–10kg/手", de: "8–12 ×3–4 · 3s ecc · 7.5→9–10kg/hand", u: "https://www.youtube.com/watch?v=riT31sLb8HU", s: "8–12×3–4 · 7.5–10kg/hand" },
+        { n: "② 支撑单臂划船 ⭐重点突破", ne: "② Chest-supported 1-arm row ⭐", d: "8–12次 ×3–4组 · 12→14kg", de: "8–12 ×3–4 · 12→14kg", u: "https://www.youtube.com/watch?v=_b6ch2nIchk", s: "8–12×3–4 · 12–14kg" },
+        { n: "③ 高位下拉", ne: "③ Lat pulldown", d: "8–12次 ×3组 · 38kg起", de: "8–12 ×3 · from 38kg", u: "https://www.youtube.com/watch?v=SALxEARiMkw", s: "8–12×3 · 38kg" },
+        { n: "④ 侧平举", ne: "④ Lateral raise", d: "12–15次 ×3组 · 4→5–6kg", de: "12–15 ×3 · 4→5–6kg", u: "https://www.youtube.com/watch?v=6a-sO62TN5E", s: "12–15×3 · 4–6kg" },
+      ]},
+      { name: "收尾", nameEn: "Finisher", items: [
+        { n: "Pallof Press 10/侧 ×3组", ne: "Pallof press 10/side ×3", d: "绳索机做 · 核心抗旋转", de: "on cable machine · anti-rotation core", u: YTS("pallof+press+prehab+guys") },
+        { n: "阶梯 10:1+1:10 · 过头三头伸展", ne: "Ladder 10:1+1:10 · Overhead triceps extension", d: "8kg · 三头 10→1", de: "8kg · triceps 10→1", u: "https://www.youtube.com/watch?v=fYqswDVbJDg", s: "8kg · 10→1" },
+        { n: "＋ 正握弯举(交替)", ne: "+ Reverse curl (alternating)", d: "8kg · 二头 1→10 · 组间少休", de: "8kg · curls 1→10 · minimal rest", u: "https://www.youtube.com/watch?v=uiH-2J85mzI", s: "8kg · 1→10" },
+      ]},
+    ],
+  },
+  {
+    key: "upperB", title: "Upper B · 肩胛控制 + 垂直推(Shai PT-2)", titleEn: "Upper B · Scap Control + Vertical Press (Shai PT-2)",
+    secs: [
+      { name: "热身 · 约6分钟", nameEn: "Warm-up · ~6 min", items: [
+        { n: "泡沫轴胸椎伸展 ×8", ne: "Foam roller T-spine extension ×8", d: "", de: "", u: YTS("thoracic+extension+foam+roller+Squat+University") },
+        { n: "费登奎斯肩拧绞", ne: "Feldenkrais shoulder wringing", d: "Shai 的动作 · 让他示范录一遍", de: "Shai's drill — ask him to demo", u: YTS("feldenkrais+shoulder+exercise") },
+        { n: "地板滑动 ×10", ne: "Floor slides ×10", d: "", de: "", u: YTS("floor+slides+scapular+E3+Rehab") },
+        { n: "弹力带分拉 ×15", ne: "Band pull-aparts ×15", d: "后三角 + 菱形肌", de: "rear delts + rhomboids", u: YTS("band+pull+apart+Athlean+X") },
+      ]},
+      { name: "主项 · 2–4组 ×8–12", nameEn: "Main · 2–4 sets ×8–12", items: [
+        { n: "① 半跪姿单臂肩推 ⭐垂直推", ne: "① Half-kneeling 1-arm press ⭐", d: "8→10kg · 从 PT-1 保留,补过头推力线", de: "8→10kg · vertical push line", u: YTS("half+kneeling+single+arm+shoulder+press+Squat+University"), s: "8–10kg" },
+        { n: "② TRX / 反向划船(宽握)", ne: "② TRX / inverted row (wide)", d: "水平拉 + 自我稳定", de: "horizontal pull + self-stabilised", u: YTS("trx+inverted+row+wide+grip") },
+        { n: "③ 俯卧划船→旋转→推", ne: "③ Prone row–rotate–press", d: "", de: "", u: YTS("prone+row+rotate+press+exercise") },
+        { n: "④ 高位平板单臂划船(窄握)", ne: "④ Elevated plank 1-arm row (narrow)", d: "抗旋转", de: "anti-rotation", u: YTS("renegade+row+single+arm+form") },
+        { n: "⑤ 俯卧反向飞鸟", ne: "⑤ Prone reverse fly", d: "后三角 + 上背", de: "rear delts + upper back", u: YTS("prone+dumbbell+reverse+fly+rear+delt") },
+        { n: "⑥ Reverse Hindu 俯卧撑", ne: "⑥ Reverse Hindu push-up", d: "肩 + 胸椎大幅活动", de: "shoulder + T-spine range", u: YTS("reverse+hindu+push+up") },
+        { n: "⑦ Cobra 俯卧撑", ne: "⑦ Cobra push-up", d: "胸椎伸展 + 肩后链 · 与 Reverse Hindu 互补", de: "T-spine extension + posterior shoulder", u: "https://www.youtube.com/watch?v=SVouNS6Q33M" },
+      ]},
+      { name: "收尾(可选) · 各20秒", nameEn: "Finisher (optional) · 20s each", items: [
+        { n: "侧平举 / AMRAP Coils / 后平举 / 熊爬1圈", ne: "Side laterals / AMRAP coils / rear laterals / bear crawl 1 lap", d: "Coils 具体动作下次问 Shai", de: "confirm coils with Shai", u: YTS("core+coil+exercise") },
+      ]},
+    ],
+  },
+  {
+    key: "heavyLower", title: "Heavy Lower · 大重量下肢(9/28 启用)", titleEn: "Heavy Lower · Max Strength (from 28 Sep)",
+    secs: [
+      { name: "热身 · 约10分钟", nameEn: "Warm-up · ~10 min", items: [
+        { n: "髋铰链持杆 ×10", ne: "Hip hinge drill (dowel) ×10", d: "", de: "", u: YTS("hip+hinge+drill+dowel+Squat+University") },
+        { n: "徒手臀桥 ×12", ne: "Glute bridge ×12", d: "", de: "", u: YTS("glute+bridge+form") },
+        { n: "轻高脚杯深蹲 ×8", ne: "Light goblet squat ×8", d: "", de: "", u: "https://www.youtube.com/watch?v=sRoJxNrfykI" },
+        { n: "Pogo 原地小跳 ×15", ne: "Pogo hops ×15", d: "", de: "", u: YTS("pogo+hops+plyometric") },
+        { n: "主项递增热身", ne: "Ramp-up sets", d: "目标重量 50%、75% 各一组", de: "1 set @50%, 1 set @75%", u: "" },
+      ]},
+      { name: "主项(组间休满 2–3 分钟 · RPE 7–8 留 2 次余量)", nameEn: "Main (rest 2–3 min · RPE 7–8)", items: [
+        { n: "① 跳箱", ne: "① Box jump", d: "3次 ×3组 · 全力跳、落箱无声、走下来 · 第5周起加低箱落地 3×3(20–30cm)", de: "3×3 · max intent, silent landing, step down · add 20–30cm drop landings from wk 5", u: "https://www.youtube.com/watch?v=G-bxQY57mKc", s: "3×3" },
+        { n: "② 六角杠硬拉", ne: "② Trap bar deadlift", d: "3–5次 ×4组 · 45–50kg 起 → 60–70kg+", de: "3–5×4 · start 45–50kg → 60–70kg+", u: "https://www.youtube.com/watch?v=TU2xZ7s4jus", s: "3–5×4 · 45–50kg" },
+        { n: "③ 杠铃深蹲(先箱蹲)", ne: "③ Barbell squat (box squat first)", d: "5次 ×4组 · 空杆 20kg 学模式 → 逐步加", de: "5×4 · learn with empty bar 20kg, then build", u: "https://www.youtube.com/watch?v=my0tLDaWyDU", s: "5×4 · 20kg+" },
+        { n: "④ 轮换A:杠铃臀桥(重)", ne: "④ Rotate A: Barbell hip thrust (heavy)", d: "6次 ×4组 · 60→80kg · 与轮换B隔次交替", de: "6×4 · 60→80kg · alternate sessions with B", u: "https://www.youtube.com/watch?v=S_uZP4UH6J0", s: "6×4 · 60kg+" },
+        { n: "④ 轮换B:重保加利亚分腿蹲", ne: "④ Rotate B: Heavy Bulgarian split squat", d: "5/侧 ×4组 · 12→14kg+/手 · 重单侧", de: "5/side ×4 · 12→14kg+/hand · heavy unilateral", u: "https://www.youtube.com/watch?v=-4LVK1crLSw", s: "5/side ×4 · 12–14kg" },
+        { n: "⑤ 提踵:站姿↔坐姿隔次轮换", ne: "⑤ Calf raise: standing ↔ seated, alternate", d: "6–8次 ×4组 · 负重 · 站姿练腓肠肌、坐姿练比目鱼肌(跑者主力)", de: "6–8×4 loaded · standing = gastroc, seated = soleus", u: "https://www.youtube.com/watch?v=ORY-ke6vcgk", s: "6–8×4 loaded" },
+      ]},
+      { name: "收尾", nameEn: "Finisher", items: [
+        { n: "重农夫行走 3×30–40米", ne: "Heavy farmer's carry 3×30–40m", d: "20kg/手起 → 加重", de: "from 20kg/hand, build", u: "https://www.youtube.com/watch?v=lLAw6fUccKA", s: "3×30–40m · 20kg+/hand" },
+      ]},
+    ],
+  },
+  {
+    key: "heavyUpper", title: "Heavy Upper · 大重量上肢(9/28 启用)", titleEn: "Heavy Upper · Max Strength (from 28 Sep)",
+    secs: [
+      { name: "热身 · 约8分钟", nameEn: "Warm-up · ~8 min", items: [
+        { n: "泡沫轴胸椎伸展 ×8", ne: "Foam roller T-spine extension ×8", d: "", de: "", u: YTS("thoracic+extension+foam+roller+Squat+University") },
+        { n: "Hooklying Arm Glides ×8", ne: "Hooklying arm glides ×8", d: "锁肩", de: "packed shoulder", u: "https://www.youtube.com/watch?v=78PqDfCiC34" },
+        { n: "弹力带分拉 ×15", ne: "Band pull-aparts ×15", d: "", de: "", u: YTS("band+pull+apart+Athlean+X") },
+        { n: "主项递增热身", ne: "Ramp-up sets", d: "目标重量 50%、75% 各一组", de: "1 set @50%, 1 set @75%", u: "" },
+      ]},
+      { name: "主项(组间休满 2–3 分钟 · RPE 7–8 留 2 次余量)", nameEn: "Main (rest 2–3 min · RPE 7–8)", items: [
+        { n: "① 站姿过头推举", ne: "① Standing overhead press", d: "4–5次 ×4组 · 哑铃 8–10kg/手起 → 12kg+ · 骨密度+肩的关键线", de: "4–5×4 · DB 8–10kg/hand → 12kg+", u: "https://www.youtube.com/watch?v=_RlRDWO2jfg", s: "4–5×4 · 8–10kg/hand" },
+        { n: "② 高位下拉(重)", ne: "② Lat pulldown (heavy)", d: "4–6次 ×4组 · 41 → 45kg+", de: "4–6×4 · 41 → 45kg+", u: "https://www.youtube.com/watch?v=SALxEARiMkw", s: "4–6×4 · 41kg+" },
+        { n: "③ 哑铃卧推", ne: "③ Dumbbell bench press", d: "4–6次 ×4组 · 10→12–14kg/手 · 无保护不用杠铃", de: "4–6×4 · 10→12–14kg/hand · no barbell without a spotter", u: "https://www.youtube.com/watch?v=SzcSrpVr0GA", s: "4–6×4 · 10–12kg/hand" },
+        { n: "④ 重支撑划船", ne: "④ Chest-supported row (heavy)", d: "6次 ×4组 · 14→16–18kg", de: "6×4 · 14→16–18kg", u: "https://www.youtube.com/watch?v=_b6ch2nIchk", s: "6×4 · 14–16kg" },
+        { n: "⑤(可选)离心引体", ne: "⑤ (optional) Eccentric pull-up", d: "3–5次 ×3组 · 跳上、5秒慢下 · 目标:年内第一个标准引体", de: "3–5×3 · jump up, 5s down · goal: first strict pull-up this year", u: "https://www.youtube.com/watch?v=YiDBLo2Ssbs", s: "3–5×3 · 5s down" },
+      ]},
+      { name: "收尾", nameEn: "Finisher", items: [
+        { n: "单侧手提行走 3×30米/侧", ne: "Suitcase carry 3×30m/side", d: "16–20kg · 抗侧屈核心 + 握力", de: "16–20kg · anti-lateral core + grip", u: "https://www.youtube.com/watch?v=3RKKnZhhelE", s: "3×30m/side · 16–20kg" },
+      ]},
+    ],
+  },
+];
+const EXLIB_NOTE = "长期轮换:单周 Lower A + Upper A,双周 Lower B + Upper B。动作到组次上限就加重(上肢约+1–2.5kg,下肢约+2.5–5kg)。马拉松窗口(至9/13):新重量首两周取下限;8/31 起重量不变、组数减半;赛前 10–14 天做最后一次重下肢;赛周只做热身级激活。力量块(9/28 起 8–12 周):每周 Heavy Lower + Heavy Upper 各 1 次(骨密度的有效剂量),A/B 可作第 3 次力量轮换;每次课只主攻一个大项冲重量,另一个轻两档练速度;首两周全部取下限,先学深蹲与过头推;每 4–6 周减载一周(重量约-20%)。";
+const EXLIB_NOTE_EN = "Long-term rotation: week 1 Lower A + Upper A, week 2 Lower B + Upper B. Add load once you hit the top of a rep range (+1–2.5kg upper, +2.5–5kg lower). Marathon window (to 13 Sep): start new lifts at the bottom weight; from 31 Aug keep weight and halve sets; last heavy lower day 10–14 days out; race week activation only. Strength block (from 28 Sep, 8–12 wks): Heavy Lower + Heavy Upper once each per week (the proven bone-density dose), A/B rotate as an optional 3rd day; push weight on ONE big lift per session, the other stays light and fast; first 2 weeks all bottom weights while learning squat + overhead press; deload every 4–6 weeks (about -20%).";
+
 // Weekly plan with the long run + quality auto-filled from race date.
 function buildWeekPlan(profile) {
   const base = (Array.isArray(profile?.planDays) && profile.planDays.length === 7) ? profile.planDays : DEFAULT_PLAN;
@@ -347,7 +521,7 @@ function buildWeekPlan(profile) {
   return {
     weeks, taper, todayIdx,
     rows: base.map((d, i) => ({
-      idx: i, type: d.type, note: d.note || "", min: null,
+      idx: i, type: d.type, note: d.note || "", note_en: d.note_en || "", min: null,
       km: d.type === "long" ? longKm : null,
       qual: d.type === "quality" ? qual : null,
       isToday: i === todayIdx,
@@ -355,13 +529,15 @@ function buildWeekPlan(profile) {
   };
 }
 // Localised { name, tgt } for one plan row (user note overrides defaults).
-function planText(r, L) {
+// Coach notes are stored bilingually (note zh / note_en); pick by lang.
+function planText(r, L, lang) {
   const name = r.type === "rest" ? L.pRest : r.type === "strength" ? L.pStrength
     : r.type === "z2" ? L.pZ2 : r.type === "long" ? L.pLong
     : r.type === "pilates" ? L.pPilates : L.pQuality;
+  const un = (lang === "en" && r.note_en) ? r.note_en : r.note;
   let tgt;
-  if (r.type === "long") tgt = r.note ? r.note : (r.km ? `${r.km}km · Z2` : "Z2");
-  else if (r.note) tgt = r.note;
+  if (r.type === "long") tgt = un ? un : (r.km ? `${r.km}km · Z2` : "Z2");
+  else if (un) tgt = un;
   else if (r.type === "rest") tgt = L.pRestNote;
   else if (r.type === "strength") tgt = L.pStrengthNote;
   else if (r.type === "z2") tgt = `${r.min || 40}min · Z2`;
@@ -448,6 +624,13 @@ const STR = {
     planPeak: "长距离峰值 (km)", planNeedDate: "在下方「备赛」设置比赛日期,自动生成马拉松进阶计划。",
     planExpand: "展开本周计划", planCollapse: "收起", planAskPh: "问教练这份计划…",
     briefShow: "展开本周周报", briefHide: "收起周报", planUpdated: "（计划表已更新）", clearChat: "清空对话",
+    exLib: "训练动作库", vidLbl: "视频", copyBtn: "复制这套(可贴进 Strava)", copied: "已复制 ✓",
+    pinTitle: "输入 PIN", pinNote: "这台设备需要解锁才能读取你的健康数据。",
+    pinSetupTitle: "设置 PIN", pinSetupNote: "设一个 4–10 位数字密码。设好之后,只有输入它才能读取你的数据——网址给别人也没关系。",
+    pinPh: "PIN(4–10 位数字)", pinPh2: "再输一次", pinSetBtn: "设置并进入", pinUnlockBtn: "解锁",
+    pinLater: "以后再说", pinTooShort: "请输入 4–10 位数字", pinMismatch: "两次输入不一致",
+    pinWrong: "PIN 不对", pinTooMany: "尝试次数太多,过一小时再试", pinSetupFail: "设置失败,请重试",
+    pinOffline: "连不上服务器,检查网络",
     planAutoNote: "长距离随赛期自动进阶、赛前自动减量。计划是参考:HRV 低或经期就把间歇/Tempo 换成 Z2。",
     todayPlan: "今日计划", dow: ["周一", "周二", "周三", "周四", "周五", "周六", "周日"],
     pPilates: "普拉提", pPilatesNote: "放松 / 恢复", planNotePh: "备注(如 下肢 / 30–45min)",
@@ -519,6 +702,13 @@ const STR = {
     planPeak: "Long-run peak (km)", planNeedDate: "Set a race date under Race below to auto-build a marathon plan.",
     planExpand: "Show full week", planCollapse: "Collapse", planAskPh: "Ask the coach about this plan…",
     briefShow: "Show weekly report", briefHide: "Hide report", planUpdated: "(plan table updated)", clearChat: "Clear chat",
+    exLib: "Exercise library", vidLbl: "Video", copyBtn: "Copy routine (paste into Strava)", copied: "Copied ✓",
+    pinTitle: "Enter PIN", pinNote: "Unlock this device to read your health data.",
+    pinSetupTitle: "Set a PIN", pinSetupNote: "Choose a 4–10 digit PIN. Once it's set, only someone who knows it can read your data — so the URL is safe to share.",
+    pinPh: "PIN (4–10 digits)", pinPh2: "Repeat PIN", pinSetBtn: "Set PIN and continue", pinUnlockBtn: "Unlock",
+    pinLater: "Later", pinTooShort: "Enter 4–10 digits", pinMismatch: "The two entries don't match",
+    pinWrong: "Wrong PIN", pinTooMany: "Too many attempts — try again in an hour", pinSetupFail: "Couldn't set the PIN, try again",
+    pinOffline: "Can't reach the server — check your connection",
     planAutoNote: "Long run auto-progresses and tapers before race day. It's a guide: swap quality for Z2 when HRV is low or during your period.",
     todayPlan: "Today's plan", dow: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
     pPilates: "Pilates", pPilatesNote: "Recovery", planNotePh: "Note (e.g. lower / 30–45min)",
@@ -549,7 +739,7 @@ function stravaAuthUrl() {
   return "https://www.strava.com/oauth/authorize?" + p.toString();
 }
 async function stravaCall(payload) {
-  const r = await fetch("/api/strava", {
+  const r = await api("/api/strava", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -603,6 +793,28 @@ export default function App() {
   const tk = todayKey();
   const restored = useRef(false);
 
+  /* ---- lock state: is a PIN configured, and are we unlocked? ---- */
+  const [lock, setLock] = useState({ checked: false, pinSet: false, unlocked: false });
+  const [skipPin, setSkipPin] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    // Any 401 from the API means the stored token is stale — re-lock.
+    setLockHandler(() => { setToken(""); setLock(l => ({ ...l, pinSet: true, unlocked: false })); });
+    (async () => {
+      try {
+        const r = await fetch("/api/auth");
+        const j = await r.json();
+        if (!alive) return;
+        const pinSet = !!j.pinSet;
+        setLock({ checked: true, pinSet, unlocked: !pinSet || !!getToken() });
+      } catch {
+        // Offline: the PIN guards the server, not this device — let the app open.
+        if (alive) setLock({ checked: true, pinSet: !!getToken(), unlocked: true });
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
   /* ---- load everything ---- */
   const reload = useCallback(async () => {
     if (!restored.current) { restored.current = true; await restoreIfEmpty(); }
@@ -625,7 +837,7 @@ export default function App() {
     setLoading(false);
   }, [tk]);
 
-  useEffect(() => { reload(); }, [reload]);
+  useEffect(() => { if (lock.unlocked) reload(); }, [reload, lock.unlocked]);
 
   /* ---- Strava: connection state, sync, OAuth redirect ---- */
   const refreshStrava = useCallback(async () => {
@@ -696,7 +908,7 @@ export default function App() {
     (async () => {
       let data;
       try {
-        const r = await fetch("/api/health");
+        const r = await api("/api/health");
         if (!r.ok) return;
         ({ data } = await r.json());
       } catch { return; }
@@ -717,9 +929,9 @@ export default function App() {
         const t = data[tk];
         if (t) {
           const parts = [];
-          if (t.sleep != null) parts.push(`${L.sleep} ${t.sleep}h`);
-          if (t.hrv != null) parts.push(`HRV ${t.hrv}`);
-          if (t.rhr != null) parts.push(`RHR ${t.rhr}`);
+          if (t.sleep != null) parts.push(`${L.sleep} ${Math.round(Number(t.sleep) * 10) / 10}h`);
+          if (vital(t.hrv, 5, 150) != null) parts.push(`HRV ${Math.round(Number(t.hrv))}`);
+          if (vital(t.rhr, 25, 150) != null) parts.push(`RHR ${Math.round(Number(t.rhr))}`);
           if (parts.length) setHealthMsg(L.healthSynced + parts.join(" · "));
         }
         reload();
@@ -767,8 +979,9 @@ export default function App() {
   function readiness() {
     let n = 0, sum = 0;
     if (daily.sleepTotal) { sum += Math.min(100, (Number(daily.sleepTotal) / SLEEP_TARGET) * 100); n++; }
-    if (daily.hrv && hrvBase) { sum += Math.max(0, Math.min(100, 50 + (Number(daily.hrv) - hrvBase) / hrvBase * 200)); n++; }
-    if (daily.rhr && rhrBase) { sum += Math.max(0, Math.min(100, 50 - (Number(daily.rhr) - rhrBase) / rhrBase * 200)); n++; }
+    const hv = vital(daily.hrv, 5, 150), rv = vital(daily.rhr, 25, 150);
+    if (hv && hrvBase) { sum += Math.max(0, Math.min(100, 50 + (hv - hrvBase) / hrvBase * 200)); n++; }
+    if (rv && rhrBase) { sum += Math.max(0, Math.min(100, 50 - (rv - rhrBase) / rhrBase * 200)); n++; }
     if (daily.energy) { sum += (Number(daily.energy) / 5) * 100; n++; }
     if (daily.mood) { sum += (Number(daily.mood) / 5) * 100; n++; }
     if (daily.soreness) { sum += ((6 - Number(daily.soreness)) / 5) * 100; n++; }
@@ -854,6 +1067,21 @@ export default function App() {
     setCoachAsking(false);
   }
 
+  if (!lock.checked) return <div className="hs-root"><Style /><div className="hs-load">{L.loading}</div></div>;
+  if (!lock.unlocked) {
+    return (
+      <LangCtx.Provider value={{ lang, L }}>
+        <PinGate mode="unlock" onDone={() => setLock(l => ({ ...l, unlocked: true }))} />
+      </LangCtx.Provider>
+    );
+  }
+  if (lock.checked && !lock.pinSet && !skipPin) {
+    return (
+      <LangCtx.Provider value={{ lang, L }}>
+        <PinGate mode="setup" onDone={() => setLock(l => ({ ...l, pinSet: true, unlocked: true }))} onSkip={() => setSkipPin(true)} />
+      </LangCtx.Provider>
+    );
+  }
   if (loading || !profile) return <div className="hs-root"><Style /><div className="hs-load">{L.loading}</div></div>;
 
   return (
@@ -921,10 +1149,69 @@ export default function App() {
 }
 
 /* ================================================================== */
+/*  PIN GATE  (setup on first run, unlock afterwards)                   */
+/* ================================================================== */
+function PinGate({ mode, onDone, onSkip }) {
+  const { L } = useLang();
+  const setup = mode === "setup";
+  const [pin, setPin] = useState("");
+  const [pin2, setPin2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const submit = async () => {
+    setErr("");
+    if (!/^\d{4,10}$/.test(pin)) { setErr(L.pinTooShort); return; }
+    if (setup && pin !== pin2) { setErr(L.pinMismatch); return; }
+    setBusy(true);
+    try {
+      const pinHash = await hashPin(pin);
+      const r = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: setup ? "setup" : "verify", pinHash }),
+      });
+      if (r.ok) { setToken(pinHash); onDone(); }
+      else if (r.status === 429) setErr(L.pinTooMany);
+      else setErr(setup ? L.pinSetupFail : L.pinWrong);
+    } catch { setErr(L.pinOffline); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="hs-root">
+      <Style />
+      <div className="hs-gate">
+        <div className="hs-gate-card">
+          <p className="hs-kicker">PERSONAL HEALTH SYSTEM</p>
+          <h1 className="hs-gate-h">{setup ? L.pinSetupTitle : L.pinTitle}</h1>
+          <p className="hs-muted-sm">{setup ? L.pinSetupNote : L.pinNote}</p>
+          <input className="hs-input" type="password" inputMode="numeric" autoFocus
+            placeholder={L.pinPh} value={pin}
+            onChange={e => setPin(e.target.value.replace(/\D/g, ""))}
+            onKeyDown={e => { if (e.key === "Enter" && !setup) submit(); }} />
+          {setup && (
+            <input className="hs-input" type="password" inputMode="numeric"
+              placeholder={L.pinPh2} value={pin2}
+              onChange={e => setPin2(e.target.value.replace(/\D/g, ""))}
+              onKeyDown={e => { if (e.key === "Enter") submit(); }} />
+          )}
+          {err && <p className="hs-gate-err">{err}</p>}
+          <button className="hs-btn primary" onClick={submit} disabled={busy}>
+            {busy ? "…" : (setup ? L.pinSetBtn : L.pinUnlockBtn)}
+          </button>
+          {setup && onSkip && <button className="hs-btn-link" onClick={onSkip}>{L.pinLater}</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
 /*  TODAY                                                               */
 /* ================================================================== */
 function Today({ daily, score, scoreTone, phase, ea, proteinTarget, todayProtein, fibreTarget, todayFibre, proteinYday, fibreYday, ateToday, coach, getCoaching, coaching, coachChat, askCoach, coachAsking, profile, saveProfile, history, trainings, meals, metrics, tk }) {
-  const { L } = useLang();
+  const { L, lang } = useLang();
   const [coachQ, setCoachQ] = useState("");
 
   // sleep summary for the status chips (last night's total vs target)
@@ -933,7 +1220,7 @@ function Today({ daily, score, scoreTone, phase, ea, proteinTarget, todayProtein
 
   // today's planned session (from the marathon week plan)
   const wplan = buildWeekPlan(profile);
-  const todayP = planText(wplan.rows[wplan.todayIdx], L);
+  const todayP = planText(wplan.rows[wplan.todayIdx], L, lang);
 
   // Inline editor for the AI coach's custom requirements.
   const [showReq, setShowReq] = useState(false);
@@ -1039,7 +1326,7 @@ function SleepPage({ daily, saveDaily, hrvBase, rhrBase, history }) {
   // reading can't blow up the whole trend's axis.
   const inRange = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : null; };
   const sleepData = last.map(h => ({ x: fmtShort(h.date), total: inRange(h.sleepTotal, 0, 20) || 0, deep: inRange(h.deep, 0, 20) || 0 }));
-  const hrData = last.filter(h => h.hrv || h.rhr).map(h => ({ x: fmtShort(h.date), hrv: inRange(h.hrv, 5, 300), rhr: inRange(h.rhr, 25, 150) }));
+  const hrData = last.filter(h => h.hrv || h.rhr).map(h => ({ x: fmtShort(h.date), hrv: inRange(h.hrv, 5, 150), rhr: inRange(h.rhr, 25, 150) }));
 
   return (
     <div className="hs-grid">
@@ -1356,24 +1643,32 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
   useEffect(() => {
     setPdays((Array.isArray(profile?.planDays) && profile.planDays.length === 7) ? profile.planDays : DEFAULT_PLAN);
   }, [profile?.planDays]);
-  const setDay = (i, k, v) => setPdays(arr => arr.map((d, j) => j === i ? { ...d, [k]: v } : d));
+  // Manually editing a day's Chinese note invalidates its stored English
+  // twin, so EN mode falls back to the fresh text instead of a stale one.
+  const setDay = (i, k, v) => setPdays(arr => arr.map((d, j) => j === i ? { ...d, [k]: v, ...(k === "note" ? { note_en: "" } : {}) } : d));
   const savePlan = () => { saveProfile({ ...profile, planDays: pdays }); setEditPlan(false); };
   const PLAN_TYPES = [["z2", L.pZ2], ["long", L.pLong], ["quality", L.pQuality], ["strength", L.pStrength], ["pilates", L.pPilates], ["rest", L.pRest]];
   const [loadingCoach, setLoadingCoach] = useState(false);
   const [coachNote, setCoachNote] = useState("");
+  const [coachNoteEn, setCoachNoteEn] = useState("");
   useEffect(() => {
     let alive = true;
-    fetch("/api/coachplan").then(r => r.json()).then(j => { if (alive && j?.note) setCoachNote(j.note); }).catch(() => {});
+    api("/api/coachplan").then(r => r.json()).then(j => {
+      if (!alive) return;
+      if (j?.note) setCoachNote(j.note);
+      if (j?.note_en) setCoachNoteEn(j.note_en);
+    }).catch(() => {});
     return () => { alive = false; };
   }, []);
   const loadCoachPlan = async () => {
     setLoadingCoach(true);
     let plan = DEFAULT_PLAN;
     try {
-      const r = await fetch("/api/coachplan");
+      const r = await api("/api/coachplan");
       const j = await r.json();
       if (Array.isArray(j?.plan) && j.plan.length === 7) plan = j.plan;
       if (j?.note) setCoachNote(j.note);
+      if (j?.note_en) setCoachNoteEn(j.note_en);
     } catch { /* fall back to built-in default */ }
     saveProfile({ ...profile, planDays: plan });
     setLoadingCoach(false);
@@ -1383,12 +1678,43 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
   const refreshAnalysis = async () => {
     setRefreshing(true); setRefreshMsg("");
     try {
-      const r = await fetch("/api/weekly");
+      const r = await api("/api/weekly");
       const j = await r.json();
       if (j?.note) setCoachNote(j.note);
+      setCoachNoteEn(j?.note_en || "");
       setRefreshMsg(j?.cooled ? L.refreshCooled(j.minutes_left) : (j?.ok ? L.refreshDone : L.refreshFail));
     } catch { setRefreshMsg(L.refreshFail); }
     setRefreshing(false);
+  };
+
+  /* ---- exercise library (collapsible routines) ---- */
+  const [libOpen, setLibOpen] = useState(null);
+  const [libCopied, setLibCopied] = useState(null);
+  const exT = (zh, en) => (lang === "en" && en ? en : zh);
+  // Strava-paste format: always English, short title, numbers only — no cues.
+  const routineText = r => {
+    const secName = sec => {
+      const en = sec.nameEn || sec.name;
+      if (en.startsWith("Warm-up")) return "Warm-up";
+      return en.replace(/ \(.*\)$/, "");
+    };
+    let out = (r.titleEn || r.title).split(" · ")[0];
+    for (const sec of r.secs) {
+      out += "\n\n" + secName(sec);
+      for (const it of sec.items) out += "\n· " + (it.ne || it.n) + (it.s ? " — " + it.s : "");
+    }
+    return out;
+  };
+  const copyRoutine = async r => {
+    const txt = routineText(r);
+    try { await navigator.clipboard.writeText(txt); }
+    catch {
+      const ta = document.createElement("textarea");
+      ta.value = txt; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch { /* give up quietly */ }
+      document.body.removeChild(ta);
+    }
+    setLibCopied(r.key); setTimeout(() => setLibCopied(null), 2000);
   };
 
   /* ---- ask the coach about THIS plan (text advice only) ---- */
@@ -1402,7 +1728,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
     const prior = planChat;
     setPlanChat(c => [...c, { role: "user", text: question }]);
     try {
-      const planStr = plan.rows.map(r => { const t = planText(r, L); return `${L.dow[r.idx]}: ${t.name} · ${t.tgt}`; }).join("\n");
+      const planStr = plan.rows.map(r => { const t = planText(r, L, lang); return `${L.dow[r.idx]}: ${t.name} · ${t.tgt}`; }).join("\n");
       const recent = (trainings || []).slice(-7).map(t => `${t.date} ${enumLabel(TRAIN_TYPES, t.type, lang)}${t.km ? " " + t.km + "km" : ""}${t.duration ? " " + t.duration + "min" : ""}`).join("\n");
       const cyc = profile?.cycleStart ? `${lang === "en" ? "Cycle start" : "周期起点"} ${profile.cycleStart}` : "";
       const primer = (lang === "en" ? "Current weekly plan:\n" : "当前每周计划:\n") + planStr
@@ -1410,8 +1736,8 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
         + (cyc ? "\n\n" + cyc : "");
       const validTypes = ["z2", "long", "quality", "strength", "pilates", "rest"];
       const sys = lang === "en"
-        ? "You are the user's personal running coach (Attia healthspan + Stacy Sims female physiology), training her healthily for a sub-4h marathon on 2026-09-13. Weekly hard rules: >=2 strength (one upper, one lower, on separate days); <=3 runs (one hard = interval OR tempo, one long, one easy); >=1 pilates; <=1 full rest day; long run only on Sat/Sun. She asks about or points out problems in the plan above. Return JSON ONLY, no other text: {\"reply\":\"short spoken advice — say which day you changed and why\",\"plan\":[7 items Mon..Sun] or null}. Only include plan when she wants the schedule changed; otherwise null. Each item is {\"type\":\"z2|long|quality|strength|pilates|rest\",\"note\":\"short note\"}. Change only what she asked, keep the other days as-is, and obey every rule."
-        : "你是用户的私人跑步教练(融合 Attia 健康寿命 + Stacy Sims 女性生理),帮她健康备战 2026-09-13 全马(目标进 4 小时)。每周硬规则:至少 2 次力量(一次上半身、一次下半身,分不同天);跑步最多 3 次(一次冲刺=间歇或 Tempo、一次长距离、一次轻松);至少 1 次普拉提;最多 1 天完全休息;长距离只放周六/周日。她会针对上面这份计划提问或指出问题。只返回 JSON,不要其他文字:{\"reply\":\"给她的口语建议,简短具体,说你改了哪天、为什么\",\"plan\":[周一..周日共 7 项] 或 null}。只有当她要调整计划时才给 plan,否则为 null。每项是 {\"type\":\"z2|long|quality|strength|pilates|rest\",\"note\":\"简短中文备注\"}。只改她要改的,其余天保持原样,遵守她所有硬规则。"
+        ? "You are the user's personal running coach (Attia healthspan + Stacy Sims female physiology), training her healthily for a sub-4h marathon on 2026-09-13. Weekly hard rules: >=2 strength (one upper, one lower, on separate days); <=3 runs (one hard = interval OR tempo, one long, one easy); >=1 pilates; <=1 full rest day; long run only on Sat/Sun. She asks about or points out problems in the plan above. Return JSON ONLY, no other text: {\"reply\":\"short spoken advice — say which day you changed and why\",\"plan\":[7 items Mon..Sun] or null}. Only include plan when she wants the schedule changed; otherwise null. Each item is {\"type\":\"z2|long|quality|strength|pilates|rest\",\"note\":\"short note in Chinese\",\"note_en\":\"same note in English\"}. Change only what she asked, keep the other days as-is, and obey every rule."
+        : "你是用户的私人跑步教练(融合 Attia 健康寿命 + Stacy Sims 女性生理),帮她健康备战 2026-09-13 全马(目标进 4 小时)。每周硬规则:至少 2 次力量(一次上半身、一次下半身,分不同天);跑步最多 3 次(一次冲刺=间歇或 Tempo、一次长距离、一次轻松);至少 1 次普拉提;最多 1 天完全休息;长距离只放周六/周日。她会针对上面这份计划提问或指出问题。只返回 JSON,不要其他文字:{\"reply\":\"给她的口语建议,简短具体,说你改了哪天、为什么\",\"plan\":[周一..周日共 7 项] 或 null}。只有当她要调整计划时才给 plan,否则为 null。每项是 {\"type\":\"z2|long|quality|strength|pilates|rest\",\"note\":\"简短中文备注\",\"note_en\":\"同内容英文备注\"}。只改她要改的,其余天保持原样(note 和 note_en 都保留),遵守她所有硬规则。"
         + (profile?.coachPrompt ? "用户额外要求(优先满足,只要安全):" + profile.coachPrompt : "");
       const msgs = [
         { role: "user", content: primer },
@@ -1424,7 +1750,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
       let reply = (j && typeof j.reply === "string" && j.reply) ? j.reply : (out || "…");
       const np = j?.plan;
       if (Array.isArray(np) && np.length === 7 && np.every(d => d && validTypes.includes(d.type))) {
-        const clean = np.map(d => ({ type: d.type, note: typeof d.note === "string" ? d.note : "" }));
+        const clean = np.map(d => ({ type: d.type, note: typeof d.note === "string" ? d.note : "", note_en: typeof d.note_en === "string" ? d.note_en : "" }));
         saveProfile({ ...profile, planDays: clean });
         reply += " " + L.planUpdated;
       }
@@ -1450,7 +1776,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
               <button className="hs-plan-toggle" onClick={() => setBriefOpen(o => !o)}>
                 {briefOpen ? L.briefHide : L.briefShow}
               </button>
-              {briefOpen && <p className="hs-brief">{coachNote}</p>}
+              {briefOpen && <p className="hs-brief">{lang === "en" && coachNoteEn ? coachNoteEn : coachNote}</p>}
             </>
           )}
           {editPlan ? (
@@ -1470,7 +1796,7 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
             <>
               <div className="hs-plan">
                 {plan.rows.map(r => {
-                  const t = planText(r, L);
+                  const t = planText(r, L, lang);
                   return (
                     <div key={r.idx} className={"hs-planrow" + (r.isToday ? " today" : "")}>
                       <span className="hs-pday">{L.dow[r.idx]}</span>
@@ -1510,6 +1836,39 @@ function TrainingPage({ tk, trainings, reload, profile, saveProfile, strava, con
               </div>
             </>
           )}
+        </Card>
+
+        <Card span2>
+          <SectionTitle>{L.exLib}</SectionTitle>
+          {EXLIB.map(r => (
+            <div key={r.key} className="hs-lib">
+              <button className="hs-lib-head" onClick={() => setLibOpen(o => o === r.key ? null : r.key)}>
+                <span>{exT(r.title, r.titleEn)}</span><span className="hs-lib-arrow">{libOpen === r.key ? "▾" : "▸"}</span>
+              </button>
+              {libOpen === r.key && (
+                <>
+                  <button className="hs-lib-copy" onClick={() => copyRoutine(r)}>
+                    {libCopied === r.key ? L.copied : L.copyBtn}
+                  </button>
+                  {r.secs.map(sec => (
+                    <div key={sec.name}>
+                      <p className="hs-lib-sec">{exT(sec.name, sec.nameEn)}</p>
+                      {sec.items.map(it => (
+                        <div key={it.n} className="hs-lib-row">
+                          <div className="hs-lib-txt">
+                            <span className="hs-lib-n">{exT(it.n, it.ne)}</span>
+                            {exT(it.d, it.de) && <span className="hs-lib-d">{exT(it.d, it.de)}</span>}
+                          </div>
+                          {it.u && <a className="hs-lib-vid" href={it.u} target="_blank" rel="noreferrer">{L.vidLbl}</a>}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          ))}
+          <p className="hs-muted-sm">{lang === "en" ? EXLIB_NOTE_EN : EXLIB_NOTE}</p>
         </Card>
 
         <Card>
@@ -2274,6 +2633,24 @@ select.hs-input{font-family:'Hanken Grotesk',sans-serif}
 .hs-supp input{accent-color:var(--pine)}
 .hs-supp svg{margin-left:auto;color:var(--soft);cursor:pointer}
 .hs-supp-sugg{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.hs-gate{display:flex;align-items:center;justify-content:center;min-height:80vh;padding:20px}
+.hs-gate-card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:26px 22px;max-width:380px;width:100%}
+.hs-gate-h{font-family:'Fraunces',serif;font-weight:500;font-size:25px;margin:6px 0 8px;letter-spacing:-.01em}
+.hs-gate-card .hs-input{margin-top:12px}
+.hs-gate-card .hs-btn{margin-top:14px}
+.hs-gate-err{color:var(--clay);font-size:13px;margin:10px 0 0}
+.hs-lib{margin-bottom:8px}
+.hs-lib-head{display:flex;justify-content:space-between;align-items:center;width:100%;background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:11px 13px;font-family:inherit;font-size:14.5px;font-weight:600;color:var(--ink);cursor:pointer;text-align:left}
+.hs-lib-arrow{color:var(--soft);margin-left:8px}
+.hs-lib-sec{font-size:12.5px;letter-spacing:.03em;color:var(--pine);font-weight:600;margin:12px 2px 4px}
+.hs-lib-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 2px;border-bottom:1px solid var(--line)}
+.hs-lib-row:last-child{border-bottom:none}
+.hs-lib-txt{min-width:0}
+.hs-lib-n{display:block;font-size:14px;color:var(--ink)}
+.hs-lib-d{display:block;font-size:12.5px;color:var(--soft);margin-top:1px}
+.hs-lib-vid{flex:none;font-size:12.5px;color:var(--pine);border:1px solid #CDDBCF;background:#E8EFE9;border-radius:8px;padding:5px 11px;text-decoration:none}
+.hs-lib-copy{width:auto;background:none;border:1px dashed var(--line);border-radius:8px;color:var(--soft);font-family:inherit;font-size:12.5px;padding:6px 12px;margin-top:8px;cursor:pointer}
+.hs-lib-copy:hover{color:var(--ink)}
 .hs-supp-edit{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .hs-supp-edit .hs-input{margin:0;flex:1}
 .hs-supp-edit svg{color:var(--soft);cursor:pointer;flex:none}

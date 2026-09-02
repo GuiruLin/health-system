@@ -6,6 +6,7 @@
 //   { action: "sync", refresh_token, after } -> refreshes token, returns recent activities
 
 import Redis from "ioredis";
+import { requireAuth } from "../lib/auth.js";
 
 const TOKEN_URL = "https://www.strava.com/oauth/token";
 const ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities";
@@ -26,7 +27,11 @@ async function tokenFromRedis() {
     const raw = await c.get("backup");
     if (!raw) return null;
     const obj = JSON.parse(raw);
-    return obj?.data?.["hs:strava:refresh"] || null;
+    const v = obj?.data?.["hs:strava:refresh"];
+    if (v == null) return null;
+    // localStorage values are JSON-encoded, so the token arrives as "\"abc\"" —
+    // unwrap it; fall back to the raw string if it isn't JSON.
+    try { return JSON.parse(v) || null; } catch { return String(v) || null; }
   } catch { return null; }
 }
 
@@ -34,6 +39,11 @@ export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
+  if (!sameOrigin(req)) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  // Proxies a connected Strava account — must not answer anonymous callers.
+  if (!(await requireAuth(req, res))) return;
   const clientId = process.env.STRAVA_CLIENT_ID;
   const clientSecret = process.env.STRAVA_CLIENT_SECRET;
   if (!clientId || !clientSecret) {
@@ -62,6 +72,10 @@ export default async function handler(req, res) {
     }
 
     if (action === "sync") {
+      // Only echo a rotated token back to a caller that supplied one. When we
+      // fall back to the stored token, the response must never contain it —
+      // otherwise this endpoint hands out a working Strava credential.
+      const callerSuppliedToken = !!body.refresh_token;
       const refresh = body.refresh_token || await tokenFromRedis();
       if (!refresh) return res.status(400).json({ error: "Missing refresh_token" });
       const tok = await postToken({
@@ -105,7 +119,7 @@ export default async function handler(req, res) {
         }
         return o;
       }));
-      return res.status(200).json({ refresh_token: tok.refresh_token, activities: slim });
+      return res.status(200).json({ ...(callerSuppliedToken ? { refresh_token: tok.refresh_token } : {}), activities: slim });
     }
 
     if (action === "zones") {
@@ -144,6 +158,14 @@ export default async function handler(req, res) {
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
+}
+
+// Allow same-origin (your own app) and header-less clients; block other sites.
+function sameOrigin(req) {
+  const host = req.headers.host;
+  const ref = req.headers.origin || req.headers.referer || "";
+  if (!ref) return true;
+  try { return new URL(ref).host === host; } catch { return false; }
 }
 
 async function postToken(params) {

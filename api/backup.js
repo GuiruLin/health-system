@@ -6,6 +6,7 @@
 //   GET                                                    -> { data, ts }
 
 import Redis from "ioredis";
+import { requireAuth } from "../lib/auth.js";
 
 const KEY = "backup";
 
@@ -24,6 +25,8 @@ export default async function handler(req, res) {
   if (!sameOrigin(req)) {
     return res.status(403).json({ error: "Forbidden" });
   }
+  // This snapshot is the entire health record — never serve it unauthenticated.
+  if (!(await requireAuth(req, res))) return;
   try {
     const redis = getClient();
 
@@ -52,8 +55,19 @@ export default async function handler(req, res) {
       if (!body.data || typeof body.data !== "object") {
         return res.status(400).json({ error: "No data" });
       }
+      const data = { ...body.data };
+      // The GET response strips the Strava token, so a browser that restored
+      // from backup holds everything EXCEPT the token. If such a client pushes
+      // a backup, don't let it erase the stored token — carry it forward.
+      if (!("hs:strava:refresh" in data)) {
+        try {
+          const curRaw = await redis.get(KEY);
+          const curTok = curRaw ? JSON.parse(curRaw)?.data?.["hs:strava:refresh"] : null;
+          if (curTok != null) data["hs:strava:refresh"] = curTok;
+        } catch { /* best effort */ }
+      }
       const ts = Number(body.ts) || Date.now();
-      await redis.set(KEY, JSON.stringify({ data: body.data, ts }));
+      await redis.set(KEY, JSON.stringify({ data, ts }));
       return res.status(200).json({ ok: true, ts });
     }
 

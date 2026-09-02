@@ -13,9 +13,14 @@
 // Upstash Redis store is connected to the project.
 
 import Redis from "ioredis";
+import { requireAuth } from "../lib/auth.js";
 
 const HKEY = "health"; // Redis hash: field = date, value = JSON of that day's metrics
 const FIELDS = ["hrv", "rhr", "sleep", "deep", "rem"];
+// Physiologically plausible ranges. A bad Apple Health sync has twice written
+// garbage (RHR ~5.4e8, HRV 207ms) — reject anything out of range at the door so
+// it never reaches storage, the trends, or the coach.
+const BOUNDS = { hrv: [5, 150], rhr: [25, 150], sleep: [0, 20], deep: [0, 20], rem: [0, 20] };
 
 // Reuse one client across warm invocations.
 let client;
@@ -44,6 +49,8 @@ export default async function handler(req, res) {
     if (req.method === "GET") {
       // Reads are limited to same-origin (your own app); other sites are blocked.
       if (!sameOrigin(req)) return res.status(403).json({ error: "Forbidden" });
+      // Writes use APP_SECRET (the iOS Shortcut); reads use the app's PIN.
+      if (!(await requireAuth(req, res))) return;
       const obj = await redis.hgetall(HKEY); // { "2026-05-31": "{...}", ... }
       const data = {};
       for (const [date, json] of Object.entries(obj || {})) {
@@ -65,14 +72,18 @@ export default async function handler(req, res) {
       const lower = {};
       for (const [k, v] of Object.entries(body)) lower[String(k).toLowerCase()] = v;
       const patch = {};
+      const dropped = [];
       for (const k of FIELDS) {
         const raw = lower[k];
         if (raw == null || raw === "") continue;
         const n = parseFloat(raw);
-        if (!isNaN(n)) patch[k] = n;
+        if (isNaN(n)) continue;
+        const [lo, hi] = BOUNDS[k] || [-Infinity, Infinity];
+        if (n < lo || n > hi) { dropped.push({ field: k, value: n }); continue; } // implausible reading — drop it
+        patch[k] = n;
       }
       if (!Object.keys(patch).length) {
-        return res.status(400).json({ error: "No valid numeric fields in body", received: body });
+        return res.status(400).json({ error: "No valid in-range numeric fields in body", received: body, dropped });
       }
 
       // Merge with whatever is already stored for that day.
@@ -82,7 +93,7 @@ export default async function handler(req, res) {
       const merged = { ...existing, ...patch };
       await redis.hset(HKEY, date, JSON.stringify(merged));
 
-      return res.status(200).json({ ok: true, date, saved: merged });
+      return res.status(200).json({ ok: true, date, saved: merged, ...(dropped.length ? { dropped } : {}) });
     }
 
     if (req.method === "DELETE") {

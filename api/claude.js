@@ -10,6 +10,7 @@
 //  - your prepaid balance + Auto-reload OFF in the Anthropic console caps total damage
 
 import Redis from "ioredis";
+import { requireAuth } from "../lib/auth.js";
 
 let client;
 function getClient() {
@@ -26,6 +27,8 @@ export default async function handler(req, res) {
   if (!sameOrigin(req)) {
     return res.status(403).json({ error: "Forbidden" });
   }
+  // Spending real money on the owner's API budget — authenticated callers only.
+  if (!(await requireAuth(req, res))) return;
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     return res.status(500).json({ error: "Server is missing ANTHROPIC_API_KEY. Set it in your Vercel project settings." });
